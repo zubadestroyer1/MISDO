@@ -232,6 +232,22 @@ function updateEnvUI(data) {
         rewEl.textContent = sr.reward > 0 ? `+${sr.reward}` : sr.reward;
         rewEl.style.color = sr.valid ? '#4ade80' : '#f87171';
     }
+
+    // Impact Analysis
+    const impactPanel = document.getElementById('impact-panel');
+    if (data.impact && impactPanel) {
+        impactPanel.style.display = 'block';
+        const imp = data.impact;
+        document.getElementById('impact-contagion').textContent = imp.contagion_risk.toFixed(2);
+        document.getElementById('impact-pollution').textContent = imp.downstream_pollution.toFixed(2);
+        document.getElementById('impact-fragments').textContent = imp.fragmentation_score + ' patches';
+        document.getElementById('impact-total').textContent = imp.total_ecosystem_cost.toFixed(2);
+
+        // Color-code the total cost
+        const totalEl = document.getElementById('impact-total');
+        totalEl.style.color = imp.total_ecosystem_cost > 50 ? '#f87171' :
+            imp.total_ecosystem_cost > 20 ? '#fbbf24' : '#4ade80';
+    }
 }
 
 function initForestClick() {

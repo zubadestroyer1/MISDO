@@ -1,0 +1,78 @@
+{
+  "train": [
+    {
+      "file": "datasets/real_tiles/train/chip_000.npz",
+      "px": 7146,
+      "py": 6520,
+      "forest_pct": 1.0
+    },
+    {
+      "file": "datasets/real_tiles/train/chip_001.npz",
+      "px": 28903,
+      "py": 20651,
+      "forest_pct": 1.0
+    },
+    {
+      "file": "datasets/real_tiles/train/chip_002.npz",
+      "px": 12562,
+      "py": 2638,
+      "forest_pct": 1.0
+    },
+    {
+      "file": "datasets/real_tiles/train/chip_003.npz",
+      "px": 13429,
+      "py": 20532,
+      "forest_pct": 1.0
+    },
+    {
+      "file": "datasets/real_tiles/train/chip_004.npz",
+      "px": 14892,
+      "py": 20706,
+      "forest_pct": 0.999
+    },
+    {
+      "file": "datasets/real_tiles/train/chip_005.npz",
+      "px": 18910,
+      "py": 29148,
+      "forest_pct": 0.986
+    },
+    {
+      "file": "datasets/real_tiles/train/chip_006.npz",
+      "px": 13339,
+      "py": 19279,
+      "forest_pct": 0.975
+    },
+    {
+      "file": "datasets/real_tiles/train/chip_007.npz",
+      "px": 17399,
+      "py": 7233,
+      "forest_pct": 0.73
+    }
+  ],
+  "test": [
+    {
+      "file": "datasets/real_tiles/test/chip_000.npz",
+      "px": 18972,
+      "py": 12730,
+      "forest_pct": 0.695
+    },
+    {
+      "file": "datasets/real_tiles/test/chip_001.npz",
+      "px": 7004,
+      "py": 2630,
+      "forest_pct": 0.496
+    },
+    {
+      "file": "datasets/real_tiles/test/chip_002.npz",
+      "px": 21171,
+      "py": 13107,
+      "forest_pct": 0.463
+    },
+    {
+      "file": "datasets/real_tiles/test/chip_003.npz",
+      "px": 24845,
+      "py": 29462,
+      "forest_pct": 0.427
+    }
+  ]
+}

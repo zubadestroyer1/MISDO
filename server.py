@@ -31,6 +31,7 @@ from data import MockEODataset
 from models import MISDOPerception, RealMISDOPerception
 from aggregator import ConditionedAggregator
 from env import DeforestationEnv, SPATIAL
+from impact import ImpactPropagation
 
 # ═══════════════════════════════════════════════════════════════════════════
 # App setup
@@ -45,6 +46,7 @@ _obs_tensor: Optional[Tensor] = None       # [1, 20, 256, 256] (legacy only)
 _domain_tensors: Optional[Dict[str, Tensor]] = None  # real domain inputs
 _agent_masks: Optional[Tensor] = None      # [1, 4, 256, 256]
 _env: Optional[DeforestationEnv] = None
+_impact: Optional[ImpactPropagation] = None
 _device: torch.device = torch.device("cpu")
 _using_real_models: bool = False
 
@@ -151,6 +153,11 @@ def _init_real_models(weights_dir: str) -> None:
             slope=_slope_tensor, river_proximity=_river_prox_tensor,
         )
     harm_np = harm.squeeze().cpu().numpy()
+
+    print("[INIT] Initializing Impact Propagation ...")
+    slope_np = _slope_tensor.squeeze().cpu().numpy() if _slope_tensor is not None else np.zeros((256, 256))
+    flow_np = _river_prox_tensor.squeeze().cpu().numpy() if _river_prox_tensor is not None else np.zeros((256, 256))
+    _impact = ImpactPropagation(flow_accumulation=flow_np, slope=slope_np)
 
     print("[INIT] Initializing RL Environment ...")
     _env = DeforestationEnv(harm_mask=harm_np)
@@ -341,6 +348,17 @@ def env_step():
         "row": row,
         "col": col,
     }
+
+    # Add impact analysis if available
+    if _impact is not None and info.get('valid', False):
+        obs = _env._get_obs()
+        forest_state = obs[1]
+        newly_cleared = np.zeros_like(forest_state)
+        newly_cleared[max(row-5,0):min(row+5,SPATIAL), max(col-5,0):min(col+5,SPATIAL)] = 1.0
+        impact_data = _impact.compute_total_ecosystem_score(
+            obs[0], forest_state, newly_cleared
+        )
+        state['impact'] = impact_data
 
     return jsonify(state)
 
