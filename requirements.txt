@@ -1,0 +1,8 @@
+torch>=2.0
+gymnasium
+stable-baselines3
+einops
+scipy
+numpy
+matplotlib
+flask

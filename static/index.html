@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description"
+        content="MISDO — Minimum-Impact Spatial Deforestation Optimizer. Real satellite-trained models for environmental risk analysis.">
+    <title>MISDO — Real Forest Risk Analysis</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+
+<body>
+
+    <div class="app-container">
+
+        <!-- ═══ Header ═══ -->
+        <header class="header">
+            <h1>MISDO Dashboard</h1>
+            <p class="subtitle">Minimum-Impact Spatial Deforestation Optimizer — Real satellite-trained models for
+                environmental risk analysis</p>
+        </header>
+
+        <!-- ═══ Location Banner ═══ -->
+        <section class="section" id="section-location">
+            <div class="location-banner">
+                <div class="location-left">
+                    <div class="location-icon">🌍</div>
+                    <div class="location-info">
+                        <div class="location-title">Test Region: <span id="location-name">Amazon Rainforest — Rondônia,
+                                Brazil</span></div>
+                        <div class="location-coords" id="location-coords">10.5°S, 63.0°W · 256×256 px @ ~30m resolution
+                        </div>
+                    </div>
+                </div>
+                <div class="location-right">
+                    <select id="location-select" class="location-selector">
+                        <option value="amazon" selected>Amazon — Rondônia, Brazil</option>
+                        <option value="borneo">Borneo — Kalimantan, Indonesia</option>
+                        <option value="congo">Congo Basin — DRC</option>
+                        <option value="california">Sierra Nevada — California, USA</option>
+                    </select>
+                    <button class="btn btn-primary btn-sm" id="btn-location" onclick="changeLocation()">
+                        🛰 Analyze Region
+                    </button>
+                </div>
+            </div>
+        </section>
+
+        <!-- ═══ Model Status ═══ -->
+        <section class="section" id="section-status">
+            <div class="model-status-bar" id="model-status-bar">
+                <!-- Populated by JS -->
+            </div>
+        </section>
+
+        <!-- ═══ Section 1: Agent Risk Maps ═══ -->
+        <section class="section" id="section-agents">
+            <div class="section-header">
+                <div class="icon agents">🛰</div>
+                <div>
+                    <div class="section-title">Domain Risk Models</div>
+                    <div class="section-desc">Satellite-trained risk surfaces from 4 independent environmental models
+                    </div>
+                </div>
+            </div>
+
+            <div class="grid-2x2" id="agent-grid">
+                <div class="card" id="agent-card-0">
+                    <div class="card-label fire-risk">🔥 Fire Risk</div>
+                    <div class="card-desc">VIIRS active fire detection — hotspot probability</div>
+                    <div class="card-img-wrapper">
+                        <img id="agent-img-0" alt="Fire risk map">
+                        <div class="loading-spinner"></div>
+                    </div>
+                    <div class="card-stats" id="agent-stats-0"></div>
+                </div>
+                <div class="card" id="agent-card-1">
+                    <div class="card-label forest-loss">🌲 Forest Loss</div>
+                    <div class="card-desc">Hansen GFC deforestation — canopy loss probability</div>
+                    <div class="card-img-wrapper">
+                        <img id="agent-img-1" alt="Forest loss risk map">
+                        <div class="loading-spinner"></div>
+                    </div>
+                    <div class="card-stats" id="agent-stats-1"></div>
+                </div>
+                <div class="card" id="agent-card-2">
+                    <div class="card-label water-pollution">💧 Water Pollution</div>
+                    <div class="card-desc">SRTM/HydroSHEDS erosion & runoff contamination</div>
+                    <div class="card-img-wrapper">
+                        <img id="agent-img-2" alt="Water pollution risk map">
+                        <div class="loading-spinner"></div>
+                    </div>
+                    <div class="card-stats" id="agent-stats-2"></div>
+                </div>
+                <div class="card" id="agent-card-3">
+                    <div class="card-label soil-risk">🏜 Soil Degradation</div>
+                    <div class="card-desc">SMAP soil moisture — drought & degradation risk</div>
+                    <div class="card-img-wrapper">
+                        <img id="agent-img-3" alt="Soil degradation risk map">
+                        <div class="loading-spinner"></div>
+                    </div>
+                    <div class="card-stats" id="agent-stats-3"></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ═══ Section 2: Aggregator ═══ -->
+        <section class="section" id="section-aggregator">
+            <div class="section-header">
+                <div class="icon aggregator">⚙</div>
+                <div>
+                    <div class="section-title">Parameter-Conditioned Aggregator</div>
+                    <div class="section-desc">Adjust model priority weights and observe non-linear risk fusion in real
+                        time</div>
+                </div>
+            </div>
+
+            <div class="grid-agg">
+                <!-- Controls panel -->
+                <div class="controls-card">
+                    <div class="slider-group">
+                        <div class="slider-header">
+                            <span class="slider-label fire-risk">🔥 Fire Risk</span>
+                            <span class="slider-value" id="slider-val-0">0.50</span>
+                        </div>
+                        <input type="range" id="slider-0" class="fire-risk" min="0" max="1" step="0.01" value="0.50">
+                    </div>
+                    <div class="slider-group">
+                        <div class="slider-header">
+                            <span class="slider-label forest-loss">🌲 Forest Loss</span>
+                            <span class="slider-value" id="slider-val-1">0.50</span>
+                        </div>
+                        <input type="range" id="slider-1" class="forest-loss" min="0" max="1" step="0.01" value="0.50">
+                    </div>
+                    <div class="slider-group">
+                        <div class="slider-header">
+                            <span class="slider-label water-pollution">💧 Water Pollution</span>
+                            <span class="slider-value" id="slider-val-2">0.50</span>
+                        </div>
+                        <input type="range" id="slider-2" class="water-pollution" min="0" max="1" step="0.01"
+                            value="0.50">
+                    </div>
+                    <div class="slider-group">
+                        <div class="slider-header">
+                            <span class="slider-label soil-risk">🏜 Soil Degradation</span>
+                            <span class="slider-value" id="slider-val-3">0.50</span>
+                        </div>
+                        <input type="range" id="slider-3" class="soil-risk" min="0" max="1" step="0.01" value="0.50">
+                    </div>
+
+                    <div class="btn-group">
+                        <button class="btn btn-primary" id="btn-recalculate" onclick="recalculate()">
+                            ✦ Recalculate
+                        </button>
+                        <button class="btn btn-outline" onclick="resetSliders()">
+                            Reset
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Aggregated harm mask result -->
+                <div class="card agg-result">
+                    <div class="card-label" style="color: var(--accent-amber);">Fused Harm Mask</div>
+                    <div class="card-desc">Non-linear aggregation with hard slope & river no-go constraints</div>
+                    <div class="card-img-wrapper">
+                        <img id="agg-img" alt="Aggregated harm mask">
+                        <div class="loading-spinner"></div>
+                    </div>
+                    <div class="agg-stats-bar" id="agg-stats">
+                        <div class="agg-stat">
+                            <div class="label">Min</div>
+                            <div class="value" id="agg-min">—</div>
+                        </div>
+                        <div class="agg-stat">
+                            <div class="label">Max</div>
+                            <div class="value" id="agg-max">—</div>
+                        </div>
+                        <div class="agg-stat">
+                            <div class="label">Mean</div>
+                            <div class="value" id="agg-mean">—</div>
+                        </div>
+                        <div class="agg-stat">
+                            <div class="label">No-Go %</div>
+                            <div class="value" id="agg-nogo">—</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ═══ Section 3: RL Environment ═══ -->
+        <section class="section" id="section-env">
+            <div class="section-header">
+                <div class="icon env">🌲</div>
+                <div>
+                    <div class="section-title">RL Harvest Environment</div>
+                    <div class="section-desc">Click on the forest to place harvest blocks — observe contiguity
+                        enforcement and edge effects</div>
+                </div>
+            </div>
+
+            <div class="env-controls-bar">
+                <div class="env-info">
+                    <div class="info-badge">Harvests <span class="val" id="env-harvests">0</span></div>
+                    <div class="info-badge">Forest <span class="val" id="env-forest">100%</span></div>
+                    <div class="info-badge">Infra <span class="val" id="env-infra">0%</span></div>
+                    <div class="info-badge" id="env-reward-badge" style="display:none;">
+                        Last Reward <span class="val" id="env-reward">—</span>
+                    </div>
+                </div>
+                <div class="btn-group" style="margin-top: 0;">
+                    <button class="btn btn-danger" onclick="resetEnv()">↺ Reset Environment</button>
+                </div>
+            </div>
+
+            <div class="grid-3col">
+                <div class="card">
+                    <div class="env-card-label">Harm Mask</div>
+                    <div class="card-img-wrapper">
+                        <img id="env-harm-img" alt="Environment harm mask">
+                        <div class="loading-spinner"></div>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="env-card-label">Forest State — click to harvest</div>
+                    <div class="card-img-wrapper clickable" id="forest-click-area">
+                        <img id="env-forest-img" alt="Forest state">
+                        <div class="loading-spinner"></div>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="env-card-label">Infrastructure</div>
+                    <div class="card-img-wrapper">
+                        <img id="env-infra-img" alt="Infrastructure state">
+                        <div class="loading-spinner"></div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+    </div>
+
+    <!-- Toast container -->
+    <div class="toast-container" id="toast-container"></div>
+
+    <script src="/static/app.js"></script>
+</body>
+
+</html>
