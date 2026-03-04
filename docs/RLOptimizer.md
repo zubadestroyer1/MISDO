@@ -40,14 +40,31 @@ When action $(r, c)$ is executed:
 
 ### Reward Structure
 
-$$R = \begin{cases} R_{\text{base}} - \sum_{(i,j) \in \text{block}} H[i,j] & \text{if contiguous (valid harvest)} \\ -100 & \text{if not contiguous (rejected)} \end{cases}$$
+$$R = \begin{cases} R_{\text{base}} - \sum H_{\text{block}} - \lambda_f \cdot \Delta F + \lambda_e \cdot E & \text{if contiguous (valid)} \\ -100 & \text{if not contiguous (rejected)} \end{cases}$$
 
-where $R_{\text{base}} = 10.0$ and $H$ is the harm mask.
+where:
+- $R_{\text{base}} = 10.0$ — base reward for valid harvest
+- $\sum H_{\text{block}}$ — sum of harm values in the harvested block
+- $\Delta F$ — number of new forest fragments created (fragmentation penalty)
+- $\lambda_f = 3.0$ — fragmentation penalty weight
+- $E$ — edge fraction of the harvest block (core-area bonus)
+- $\lambda_e = 1.5$ — edge bonus weight
 
-The agent is incentivised to:
-- Harvest in low-harm areas (low $\sum H$)
-- Maintain contiguity with existing infrastructure
-- Avoid triggering excessive edge effects
+### Fragmentation Penalty
+
+After each harvest, connected forest components are counted using 8-connectivity (`scipy.ndimage.label`). If the harvest splits contiguous forest into $n$ new fragments:
+
+$$\text{frag\_penalty} = 3.0 \times \max(0, C_{\text{after}} - C_{\text{before}})$$
+
+This strongly discourages cutting corridors through intact forest — preserving ecological connectivity.
+
+### Core-Area Bonus
+
+The **edge fraction** measures what proportion of harvested forest pixels are on the forest boundary (adjacent to already-cleared or non-forest pixels):
+
+$$E = \frac{|\{p \in \text{block} : p \text{ is forest} \wedge \exists q \in N_4(p) : q \text{ is non-forest}\}|}{|\{p \in \text{block} : p \text{ is forest}\}|}$$
+
+High edge fraction → bonus. This rewards harvesting at forest edges rather than punching into interior habitat.
 
 ### Episode Termination
 

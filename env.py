@@ -12,6 +12,13 @@ Action Space : Discrete(256 * 256) = Discrete(65536)
     Flattened (row, col) coordinate of the harvest block centre.
 
 Episode ends after 50 valid harvests (quota met).
+
+Reward includes:
+    - Base reward for valid contiguous harvests
+    - Harm penalty (sum of harm mask in harvested block)
+    - Fragmentation penalty (splitting forest into disconnected components)
+    - Core-area bonus (harvesting at edges preserves interior habitat)
+    - Dynamic edge effects (1.2× harm multiplier on newly exposed forest edges)
 """
 
 from __future__ import annotations
@@ -21,7 +28,7 @@ from typing import Any, Dict, Optional, Tuple
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
-from scipy.ndimage import binary_dilation
+from scipy.ndimage import binary_dilation, label
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +46,54 @@ REWARD_REJECT: float = -100.0  # penalty for non-contiguous action
 # Edge-effect parameters
 DILATION_PX: int = 2
 EDGE_MULTIPLIER: float = 1.2
+
+# Fragmentation penalty parameters
+FRAGMENTATION_WEIGHT: float = 3.0   # penalty per new fragment created
+CORE_AREA_BONUS: float = 1.5        # bonus for harvesting at forest edges
+
+
+def _count_forest_components(forest: np.ndarray) -> int:
+    """Count the number of connected forest components using 8-connectivity."""
+    struct = np.ones((3, 3), dtype=bool)  # 8-connected
+    _, n_components = label(forest > 0.5, structure=struct)
+    return n_components
+
+
+def _compute_edge_fraction(forest: np.ndarray, r0: int, r1: int, c0: int, c1: int) -> float:
+    """Compute what fraction of harvested pixels are on the forest edge.
+
+    Edge pixels are forest pixels adjacent to non-forest (infrastructure,
+    already harvested, or grid boundary). High edge fraction = good
+    (harvesting at edges preserves interior habitat).
+
+    Returns a value in [0, 1].
+    """
+    block = forest[r0:r1, c0:c1]
+    if block.sum() < 1:
+        return 0.0
+
+    # Pad the full forest grid's sub-region with 0 (boundary = non-forest)
+    # Check each forest pixel in the block for non-forest neighbours
+    padded = np.pad(forest, 1, mode="constant", constant_values=0)
+    # Adjust indices for padding
+    pr0, pr1, pc0, pc1 = r0 + 1, r1 + 1, c0 + 1, c1 + 1
+
+    edge_count = 0
+    total_forest = 0
+
+    for r in range(pr0, pr1):
+        for c in range(pc0, pc1):
+            if padded[r, c] > 0.5:
+                total_forest += 1
+                # Check 4-connected neighbours
+                neighbours = [
+                    padded[r - 1, c], padded[r + 1, c],
+                    padded[r, c - 1], padded[r, c + 1],
+                ]
+                if any(n < 0.5 for n in neighbours):
+                    edge_count += 1
+
+    return edge_count / max(total_forest, 1)
 
 
 class DeforestationEnv(gym.Env):
@@ -117,12 +172,20 @@ class DeforestationEnv(gym.Env):
             # Block does not touch any existing infrastructure → reject
             return self._get_obs(), REWARD_REJECT, False, False, {"valid": False}
 
-        # --- Apply harvest ---
-        # Snapshot the harvested area before clearing (for edge-effect mask)
+        # --- Pre-harvest measurements ---
         pre_forest = self._forest.copy()
+        n_components_before = _count_forest_components(self._forest)
 
+        # Edge fraction: how much of the harvest block is on the forest edge
+        edge_fraction = _compute_edge_fraction(self._forest, r0, r1, c0, c1)
+
+        # --- Apply harvest ---
         self._forest[r0:r1, c0:c1] = 0.0
         self._infra[r0:r1, c0:c1] = 1.0
+
+        # --- Post-harvest measurements ---
+        n_components_after = _count_forest_components(self._forest)
+        new_fragments = max(0, n_components_after - n_components_before)
 
         # --- Dynamic edge effects ---
         newly_cleared: np.ndarray = (pre_forest == 1.0) & (self._forest == 0.0)
@@ -136,7 +199,15 @@ class DeforestationEnv(gym.Env):
 
         # --- Reward ---
         block_harm: float = float(self._harm_mask[r0:r1, c0:c1].sum())
-        reward: float = REWARD_BASE - block_harm
+        fragmentation_penalty: float = FRAGMENTATION_WEIGHT * new_fragments
+        core_area_bonus: float = CORE_AREA_BONUS * edge_fraction
+
+        reward: float = (
+            REWARD_BASE
+            - block_harm
+            - fragmentation_penalty
+            + core_area_bonus
+        )
 
         self._harvest_count += 1
         terminated: bool = self._harvest_count >= MAX_HARVESTS
@@ -146,7 +217,14 @@ class DeforestationEnv(gym.Env):
             reward,
             terminated,
             False,
-            {"valid": True, "harvest_count": self._harvest_count},
+            {
+                "valid": True,
+                "harvest_count": self._harvest_count,
+                "new_fragments": new_fragments,
+                "edge_fraction": round(edge_fraction, 3),
+                "fragmentation_penalty": round(fragmentation_penalty, 2),
+                "core_area_bonus": round(core_area_bonus, 2),
+            },
         )
 
     # ------------------------------------------------------------------
@@ -172,4 +250,25 @@ if __name__ == "__main__":
     action = 5 * SPATIAL + 1  # row=5, col=1 (next to col-0 road)
     obs, rew, term, trunc, info = env.step(action)
     print(f"Step reward: {rew:.2f}  valid: {info.get('valid')}")
+    print(f"  new_fragments: {info.get('new_fragments')}")
+    print(f"  edge_fraction: {info.get('edge_fraction')}")
+    print(f"  fragmentation_penalty: {info.get('fragmentation_penalty')}")
+    print(f"  core_area_bonus: {info.get('core_area_bonus')}")
     print(f"Obs shape after step: {obs.shape}")
+
+    # Run a few more steps to see fragmentation in action
+    total_reward = 0.0
+    total_frags = 0
+    for i in range(10):
+        row = (i + 1) * 20
+        col = 1
+        action = row * SPATIAL + col
+        obs, rew, term, trunc, info = env.step(action)
+        if info.get("valid"):
+            total_reward += rew
+            total_frags += info.get("new_fragments", 0)
+            print(f"  Step {i+2}: rew={rew:.2f}  frags={info.get('new_fragments')}  "
+                  f"edge={info.get('edge_fraction')}")
+
+    print(f"\nTotal reward: {total_reward:.2f}")
+    print(f"Total new fragments: {total_frags}")

@@ -1,15 +1,15 @@
-# Aggregator — Parameter-Conditioned Spatial Risk Fusion
+# Aggregator — Learnable Parameter-Conditioned Spatial Risk Fusion
 
 ## Overview
 
-The **ConditionedAggregator** is a deterministic fusion module that combines the 4 domain-specific risk masks into a single **Final Harm Mask**. It applies user-defined priority weights, Gaussian spatial smoothing for contiguous risk regions, and hard boolean constraints for environmental no-go zones.
+The **ConditionedAggregator** is a learned fusion module that combines the 4 domain-specific risk masks into a single **Final Harm Mask**. It uses a small 1×1 convolutional network to capture non-linear cross-domain interactions, followed by Gaussian spatial smoothing and hard boolean constraints for environmental no-go zones.
 
 | Property | Value |
 |---|---|
-| **Type** | Deterministic (no learnable parameters) |
+| **Type** | Learned (1×1 conv fusion network) |
+| **Learnable Parameters** | ~833 |
 | **Input** | Agent masks `[B, 4, 256, 256]` + user weights `[B, 4]` + optional slope/river tensors |
 | **Output** | `[B, 1, 256, 256]` — Final Harm Mask ∈ [0, 1] |
-| **Parameters** | 0 (buffer-only: pre-computed Gaussian kernel) |
 
 ---
 
@@ -17,62 +17,72 @@ The **ConditionedAggregator** is a deterministic fusion module that combines the
 
 ```
 Agent_Masks  [B, 4, 256, 256]  ─┐
-User_Weights [B, 4]             ─┤→ Weighted Sum → Gaussian Blur → Hard Constraints → Final_Harm_Mask
-Slope        [B, 1, H, W]      ─┤                                                      [B, 1, 256, 256]
+                                 ├→ Concat [B, 8, H, W] → Learned Fusion → Gaussian Blur → Hard Constraints
+User_Weights [B, 4] broadcast  ─┤                                                        → Final_Harm_Mask
+Slope        [B, 1, H, W]      ─┤                                                          [B, 1, 256, 256]
 River_Prox   [B, 1, H, W]      ─┘
 ```
 
 ---
 
-## Mathematical Formulation
+## Architecture
 
-### Step 1: Weighted Sum
+### Learned Fusion Network
 
-Given agent masks $\mathbf{M} \in \mathbb{R}^{B \times 4 \times H \times W}$ and user weights $\mathbf{w} \in \mathbb{R}^{B \times 4}$:
+User weights `[B, 4]` are broadcast to `[B, 4, H, W]` and concatenated with the 4 agent masks to form an 8-channel input. This is passed through a 3-layer 1×1 conv network:
 
-$$\mathbf{H}_{\text{raw}}[b, 1, h, w] = \frac{\sum_{c=1}^{4} w_{b,c} \cdot M_{b,c,h,w}}{\sum_{c=1}^{4} w_{b,c}}$$
+```
+Input [B, 8, H, W]  (4 masks + 4 weight channels)
+  │
+  ▼
+Conv1×1(8→32)  + GELU
+Conv1×1(32→16) + GELU
+Conv1×1(16→1)  → Sigmoid → [B, 1, H, W]
+```
 
-This is a normalised weighted average — if a user sets weights `[0.9, 0.1, 0.5, 0.2]`, fire risk (0.9) dominates while forest risk (0.1) has minimal influence.
+**Why 1×1 convolutions?** Each pixel is fused independently — the network learns per-pixel non-linear interactions between domains (e.g., fire × low moisture = exponentially worse) without introducing spatial blur. Spatial coherence is handled downstream by the Gaussian smoothing.
 
-### Step 2: Gaussian Smoothing
+**Why this captures cross-domain interactions:**
+- Standard weighted sum: `harm = w1*fire + w2*forest + w3*hydro + w4*soil` (linear only)
+- Learned fusion: `harm = f(fire, forest, hydro, soil, w1, w2, w3, w4)` where f is a non-linear function that can learn:
+  - Multiplicative interactions (fire × drought risk)
+  - Threshold effects (high risk only when multiple factors align)
+  - Weight-dependent gating (suppress a domain when user weight is low)
 
-A 2D Gaussian kernel $\mathbf{G}$ is convolved with the raw harm mask to produce spatially contiguous risk regions:
+### Initialization
 
-$$\mathbf{H}_{\text{smooth}} = \mathbf{G}_{\sigma, k} * \mathbf{H}_{\text{raw}}$$
+Xavier uniform with gain=0.5 and zero biases ensure initial outputs near sigmoid(0) = 0.5. This prevents extreme harm estimates before training.
 
-where:
-- $\sigma = 4.0$ pixels
-- $k = 21$ (kernel size, odd)
-- Reflect padding is used to handle boundaries
+### Post-Fusion Processing
 
-The Gaussian kernel:
-
-$$G(x, y) = \frac{1}{2\pi\sigma^2} \exp\left(-\frac{x^2 + y^2}{2\sigma^2}\right)$$
-
-This smoothing is critical for the RL environment — it prevents the agent from exploiting isolated low-risk pixels surrounded by high-risk areas.
-
-### Step 3: Hard Boolean Constraints
-
-Two deterministic no-go zones override the smoothed risk to maximum (1.0):
-
-**Slope constraint:**
-
-$$\mathbf{H}[h, w] = \begin{cases} 1.0 & \text{if slope}[h, w] > 0.8 \\ \mathbf{H}_{\text{smooth}}[h, w] & \text{otherwise} \end{cases}$$
-
-**River proximity constraint:**
-
-$$\mathbf{H}[h, w] = \begin{cases} 1.0 & \text{if river\_proximity}[h, w] < 0.05 \\ \mathbf{H}[h, w] & \text{otherwise} \end{cases}$$
-
-These enforce physical forestry regulations: steep slopes (>~72°) are unsafe for logging equipment, and areas too close to rivers are protected riparian zones.
+Same as before:
+1. **Gaussian smoothing** (σ=4.0, k=21) for spatial coherence
+2. **Hard constraints**: slope > 0.8 → no-go (set to 1.0), river proximity < 0.05 → no-go
 
 ---
 
-## Why This Design is Optimal
+## Mathematical Formulation
 
-1. **Deterministic**: No training required — the aggregator's behaviour is fully specified by user weights and physical constraints. This ensures interpretability for decision-makers.
-2. **Gaussian Smoothing**: Prevents "checkerboard" risk patterns that would confuse the RL agent. Real deforestation risk is spatially continuous.
-3. **Hard Constraints**: Non-negotiable environmental protections are enforced post-smoothing, so no amount of low risk in surrounding areas can override them.
-4. **User-Conditioned**: Different stakeholders (logging company vs. conservation agency) can set different weight vectors to get different harm masks — enabling multi-objective decision-making.
+### Learned Fusion
+
+Given agent masks $\mathbf{M} \in \mathbb{R}^{B \times 4 \times H \times W}$ and user weights $\mathbf{w} \in \mathbb{R}^{B \times 4}$:
+
+$$\mathbf{w}_{\text{spatial}} = \text{broadcast}(\mathbf{w}) \in \mathbb{R}^{B \times 4 \times H \times W}$$
+
+$$\mathbf{F} = [\mathbf{M}; \mathbf{w}_{\text{spatial}}] \in \mathbb{R}^{B \times 8 \times H \times W}$$
+
+$$\mathbf{H}_{\text{raw}} = \sigma\left(\mathbf{W}_3 \cdot \text{GELU}\left(\mathbf{W}_2 \cdot \text{GELU}(\mathbf{W}_1 \cdot \mathbf{F} + \mathbf{b}_1) + \mathbf{b}_2\right) + \mathbf{b}_3\right)$$
+
+Where $\mathbf{W}_1 \in \mathbb{R}^{32 \times 8}$, $\mathbf{W}_2 \in \mathbb{R}^{16 \times 32}$, $\mathbf{W}_3 \in \mathbb{R}^{1 \times 16}$ (all 1×1 conv weights).
+
+---
+
+## Why Learned Fusion is Optimal
+
+1. **Non-linear interactions**: Real environmental risks compound non-linearly. Fire risk in drought-stressed forest is far worse than the sum of fire and drought individually.
+2. **Weight-conditioned**: The network sees user weights as input channels — it learns different fusion strategies for different stakeholder priorities.
+3. **Lightweight**: 833 parameters — negligible overhead vs. the ~12M in domain models.
+4. **Trainable end-to-end**: Can be fine-tuned with the RL environment's reward signal via backpropagation.
 
 ---
 
