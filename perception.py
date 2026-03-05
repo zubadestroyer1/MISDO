@@ -1,13 +1,19 @@
 """
 MISDO Module 2 — Shared Backbone & Agent Decoders
 ===================================================
-ConvNeXt-Tiny encoder (in_channels=20) producing a dense latent feature map,
-plus four lightweight U-Net-style decoder heads that output per-pixel risk
-masks at full spatial resolution.
+Orchestrates the 4 domain-specific models, optionally fusing their
+bottleneck features via CrossDomainFusion before decoding.
 
-Backbone output : [B, 256, 64, 64]
-Each head output : [B, 1, 256, 256]
-Stacked output  : [B, 4, 256, 256]
+Legacy (MISDOPerception):
+    ConvNeXt-Tiny encoder (in_channels=20) + 4 decoder heads.
+    Input  : [B, 20, 256, 256]
+    Output : [B, 4, 256, 256]
+
+Real (RealMISDOPerception):
+    4 trained ConvNeXt-V2 + UNet++ domain models with cross-domain
+    feature fusion at the bottleneck level.
+    Input  : Dict of domain tensors (fire, forest, hydro, soil)
+    Output : [B, 4, 256, 256]
 """
 
 from __future__ import annotations
@@ -21,7 +27,7 @@ from torch import Tensor
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ConvNeXt building blocks
+# ConvNeXt building blocks (legacy backbone — kept for backward compat)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class ConvNeXtBlock(nn.Module):
@@ -30,18 +36,18 @@ class ConvNeXtBlock(nn.Module):
     def __init__(self, dim: int, expansion: int = 4) -> None:
         super().__init__()
         self.dw_conv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
-        self.norm = nn.GroupNorm(1, dim)  # equivalent to LayerNorm per channel
+        self.norm = nn.GroupNorm(1, dim)
         self.pw1 = nn.Conv2d(dim, dim * expansion, kernel_size=1)
         self.act = nn.GELU()
         self.pw2 = nn.Conv2d(dim * expansion, dim, kernel_size=1)
 
     def forward(self, x: Tensor) -> Tensor:
-        residual = x                         # Shape: [B, C, H, W]
-        x = self.dw_conv(x)                  # Shape: [B, C, H, W]
+        residual = x
+        x = self.dw_conv(x)
         x = self.norm(x)
-        x = self.pw1(x)                      # Shape: [B, C*4, H, W]
+        x = self.pw1(x)
         x = self.act(x)
-        x = self.pw2(x)                      # Shape: [B, C, H, W]
+        x = self.pw2(x)
         return x + residual
 
 
@@ -75,51 +81,38 @@ class ConvNeXtStage(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Shared ConvNeXt-Tiny Backbone
+# Legacy Shared ConvNeXt-Tiny Backbone
 # ═══════════════════════════════════════════════════════════════════════════
 
 class ConvNeXtBackbone(nn.Module):
-    """Lightweight ConvNeXt encoder.
+    """Lightweight ConvNeXt encoder (legacy).
 
     Input  : [B, 20, 256, 256]
     Output : [B, 256, 64, 64]
-
-    Architecture (4× spatial downsample total):
-        Stem  : 20 → 64,  stride 2   → 128×128
-        Stage1: 64 → 128, stride 2   → 64×64
-        Stage2: 128 → 256, stride 1  → 64×64  (no further downsampling)
     """
 
     def __init__(self, in_channels: int = 20, base_dim: int = 64) -> None:
         super().__init__()
-        # Stem — patchify with stride-2 conv
         self.stem = nn.Sequential(
             nn.Conv2d(in_channels, base_dim, kernel_size=4, stride=2, padding=1),
             nn.GroupNorm(1, base_dim),
-        )  # [B, 64, 128, 128]
-
+        )
         self.stage1 = ConvNeXtStage(base_dim, base_dim * 2, depth=2, downsample=True)
-        # [B, 128, 64, 64]
-
         self.stage2 = ConvNeXtStage(base_dim * 2, base_dim * 4, depth=2, downsample=False)
-        # [B, 256, 64, 64]
 
     def forward(self, x: Tensor) -> Tensor:
-        x = self.stem(x)       # Shape: [B, 64, 128, 128]
-        x = self.stage1(x)     # Shape: [B, 128, 64, 64]
-        x = self.stage2(x)     # Shape: [B, 256, 64, 64]
+        x = self.stem(x)
+        x = self.stage1(x)
+        x = self.stage2(x)
         return x
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Lightweight U-Net–style Decoder Head
+# Legacy Decoder Head
 # ═══════════════════════════════════════════════════════════════════════════
 
 class DecoderHead(nn.Module):
-    """Maps latent [B, 256, 64, 64] → [B, 1, 256, 256] with Sigmoid.
-
-    Two transposed-conv upsample stages (×2 each = ×4 total).
-    """
+    """Maps latent [B, 256, 64, 64] → [B, 1, 256, 256] with Sigmoid."""
 
     def __init__(self, in_channels: int = 256) -> None:
         super().__init__()
@@ -127,50 +120,40 @@ class DecoderHead(nn.Module):
             nn.ConvTranspose2d(in_channels, 128, kernel_size=2, stride=2),
             nn.GroupNorm(1, 128),
             nn.GELU(),
-        )  # [B, 128, 128, 128]
-
+        )
         self.up2 = nn.Sequential(
             nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2),
             nn.GroupNorm(1, 64),
             nn.GELU(),
-        )  # [B, 64, 256, 256]
-
-        self.head = nn.Conv2d(64, 1, kernel_size=1)  # [B, 1, 256, 256]
+        )
+        self.head = nn.Conv2d(64, 1, kernel_size=1)
 
     def forward(self, x: Tensor) -> Tensor:
-        x = self.up1(x)            # Shape: [B, 128, 128, 128]
-        x = self.up2(x)            # Shape: [B, 64, 256, 256]
-        x = self.head(x)           # Shape: [B, 1, 256, 256]
-        return torch.sigmoid(x)    # Bounded [0, 1]
+        x = self.up1(x)
+        x = self.up2(x)
+        x = self.head(x)
+        return torch.sigmoid(x)
 
 
-# Named aliases for clarity (identical architecture, independent weights)
 class HydrologyHead(DecoderHead):
-    """Soil erosion / runoff risk decoder."""
     pass
-
 
 class BiodiversityHead(DecoderHead):
-    """Habitat fragmentation risk decoder."""
     pass
-
 
 class ClimateHead(DecoderHead):
-    """Carbon / biomass loss risk decoder."""
     pass
 
-
 class FireHead(DecoderHead):
-    """Wildfire wind-tunnel risk decoder."""
     pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Full Perception Module
+# Legacy Full Perception Module
 # ═══════════════════════════════════════════════════════════════════════════
 
 class MISDOPerception(nn.Module):
-    """Backbone + 4 decoder heads.
+    """Legacy backbone + 4 decoder heads.
 
     Input  : [B, 20, 256, 256]
     Output : Agent_Masks [B, 4, 256, 256]
@@ -191,14 +174,12 @@ class MISDOPerception(nn.Module):
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        latent: Tensor = self.backbone(x)  # Shape: [B, 256, 64, 64]
-
+        latent: Tensor = self.backbone(x)
         masks: list[Tensor] = []
         for name in self.HEAD_NAMES:
-            mask = self.heads[name](latent)  # Shape: [B, 1, 256, 256]
+            mask = self.heads[name](latent)
             masks.append(mask)
-
-        agent_masks: Tensor = torch.cat(masks, dim=1)  # Shape: [B, 4, 256, 256]
+        agent_masks: Tensor = torch.cat(masks, dim=1)
         return agent_masks
 
 
@@ -207,10 +188,13 @@ class MISDOPerception(nn.Module):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class RealMISDOPerception(nn.Module):
-    """Loads 4 trained domain-specific models and stacks their outputs.
+    """Loads 4 trained ConvNeXt-V2 + UNet++ domain models, fuses their
+    bottleneck features via CrossDomainFusion, and stacks decoded outputs.
 
-    Each sub-model takes its own domain-specific input and produces
-    a [B, 1, 256, 256] risk mask. Stacked output: [B, 4, 256, 256].
+    Each sub-model's encoder produces a bottleneck feature map.
+    CrossDomainFusion exchanges information between all 4 domain
+    bottlenecks before each decoder runs, enabling early cross-domain
+    interactions (e.g., slope × fire → amplified erosion risk).
 
     Input  : Dict of domain tensors (fire, forest, hydro, soil)
     Output : Agent_Masks [B, 4, 256, 256]
@@ -218,13 +202,14 @@ class RealMISDOPerception(nn.Module):
 
     HEAD_NAMES: List[str] = ["fire", "forest", "hydro", "soil"]
 
-    def __init__(self, weights_dir: str = "weights") -> None:
+    def __init__(self, weights_dir: str = "weights", use_fusion: bool = True) -> None:
         super().__init__()
         import os
         from models.fire_model import FireRiskNet
         from models.forest_model import ForestLossNet
         from models.hydro_model import HydroRiskNet
         from models.soil_model import SoilRiskNet
+        from models.fusion import CrossDomainFusion
 
         self.sub_models = nn.ModuleDict({
             "fire": FireRiskNet(),
@@ -233,18 +218,43 @@ class RealMISDOPerception(nn.Module):
             "soil": SoilRiskNet(),
         })
 
-        # Load trained weights if available
+        # Load trained weights if available (tolerant of shape mismatches
+        # from architecture changes, e.g., ConvTranspose2d → Conv2d)
         for name in self.HEAD_NAMES:
             path = os.path.join(weights_dir, f"{name}_model.pt")
             if os.path.exists(path):
-                state = torch.load(path, map_location="cpu", weights_only=True)
-                self.sub_models[name].load_state_dict(state)
-                print(f"  [RealPerception] Loaded weights: {path}")
+                saved_state = torch.load(path, map_location="cpu", weights_only=True)
+                model_state = self.sub_models[name].state_dict()
+                # Filter out keys with shape mismatches
+                compatible = {}
+                skipped = []
+                for k, v in saved_state.items():
+                    if k in model_state and v.shape == model_state[k].shape:
+                        compatible[k] = v
+                    else:
+                        skipped.append(k)
+                self.sub_models[name].load_state_dict(compatible, strict=False)
+                n_loaded = len(compatible)
+                n_total = len(model_state)
+                print(f"  [RealPerception] Loaded {n_loaded}/{n_total} params from {path}")
+                if skipped:
+                    print(f"    (skipped {len(skipped)} incompatible keys, will retrain)")
             else:
                 print(f"  [RealPerception] No weights found at {path}, using random init")
 
+        # Cross-domain feature fusion
+        self.use_fusion = use_fusion
+        if use_fusion:
+            domain_channels = {
+                name: self.sub_models[name].BOTTLENECK_CHANNELS
+                for name in self.HEAD_NAMES
+            }
+            self.fusion = CrossDomainFusion(domain_channels)
+            print(f"  [RealPerception] CrossDomainFusion enabled "
+                  f"({sum(p.numel() for p in self.fusion.parameters()):,} params)")
+
     def forward(self, domain_inputs: dict) -> Tensor:
-        """Run each sub-model on its domain input and stack results.
+        """Run each sub-model's encoder, fuse bottlenecks, then decode.
 
         Parameters
         ----------
@@ -252,10 +262,25 @@ class RealMISDOPerception(nn.Module):
             Keys: "fire", "forest", "hydro", "soil"
             Values: Tensor [B, C_i, 256, 256] where C_i varies per domain.
         """
-        masks: list[Tensor] = []
+        # Phase 1: Encode all domains
+        bottlenecks: dict = {}
+        all_skips: dict = {}
         for name in self.HEAD_NAMES:
             x = domain_inputs[name]
-            mask = self.sub_models[name](x)  # [B, 1, 256, 256]
+            model = self.sub_models[name]
+            b, skips = model.encode(x)
+            bottlenecks[name] = b
+            all_skips[name] = skips
+
+        # Phase 2: Cross-domain fusion (enriches bottlenecks)
+        if self.use_fusion:
+            bottlenecks = self.fusion(bottlenecks)
+
+        # Phase 3: Decode each domain from enriched bottleneck
+        masks: list[Tensor] = []
+        for name in self.HEAD_NAMES:
+            model = self.sub_models[name]
+            mask = model.decode(bottlenecks[name], all_skips[name])
             masks.append(mask)
 
         return torch.cat(masks, dim=1)  # [B, 4, 256, 256]
@@ -269,8 +294,7 @@ if __name__ == "__main__":
     model = MISDOPerception(in_channels=20)
     dummy = torch.randn(1, 20, 256, 256)
     out = model(dummy)
-    print(f"Agent_Masks shape: {out.shape}")   # Expected: [1, 4, 256, 256]
+    print(f"Agent_Masks shape: {out.shape}")
     print(f"  min={out.min():.4f}  max={out.max():.4f}")
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters : {total_params:,}")
-

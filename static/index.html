@@ -103,6 +103,19 @@
                     <div class="card-stats" id="agent-stats-3"></div>
                 </div>
             </div>
+
+            <!-- Reference image: raw input data (no model masks) -->
+            <div class="reference-card" id="reference-card" style="display:none; margin-top: 1.2rem;">
+                <div class="card" style="max-width: 480px; margin: 0 auto;">
+                    <div class="card-label" style="color: #86efac;">🗺 Reference: Raw Forest Canopy</div>
+                    <div class="card-desc">Input data before any risk model is applied — forest canopy cover from Hansen
+                        GFC</div>
+                    <div class="card-img-wrapper">
+                        <img id="reference-img" alt="Reference forest canopy cover">
+                        <div class="loading-spinner"></div>
+                    </div>
+                </div>
+            </div>
         </section>
 
         <!-- ═══ Section 2: Aggregator ═══ -->
@@ -159,10 +172,26 @@
                     </div>
                 </div>
 
-                <!-- Aggregated harm mask result -->
+                <!-- Aggregated results — 3 output views -->
+                <div class="card agg-result" style="border: 2px solid #4ade80;">
+                    <div class="card-label" style="color: #4ade80;">✅ Recommended Harvest Zones</div>
+                    <div class="card-desc">Safe-to-harvest areas (low harm, forested, accessible)</div>
+                    <div class="card-img-wrapper">
+                        <img id="agg-recommended-img" alt="Recommended harvest zones">
+                        <div class="loading-spinner"></div>
+                    </div>
+                </div>
                 <div class="card agg-result">
-                    <div class="card-label" style="color: var(--accent-amber);">Fused Harm Mask</div>
-                    <div class="card-desc">Non-linear aggregation with hard slope & river no-go constraints</div>
+                    <div class="card-label" style="color: #86efac;">🛡 Safety Gradient</div>
+                    <div class="card-desc">Continuous safety surface — green = safest (1 − harm)</div>
+                    <div class="card-img-wrapper">
+                        <img id="agg-safety-img" alt="Safety gradient mask">
+                        <div class="loading-spinner"></div>
+                    </div>
+                </div>
+                <div class="card agg-result">
+                    <div class="card-label" style="color: var(--accent-amber);">⚠ Harm Mask</div>
+                    <div class="card-desc">Danger surface — bright = harmful to deforest</div>
                     <div class="card-img-wrapper">
                         <img id="agg-img" alt="Aggregated harm mask">
                         <div class="loading-spinner"></div>
@@ -183,6 +212,10 @@
                         <div class="agg-stat">
                             <div class="label">No-Go %</div>
                             <div class="value" id="agg-nogo">—</div>
+                        </div>
+                        <div class="agg-stat">
+                            <div class="label" style="color: #4ade80;">Rec'd %</div>
+                            <div class="value" id="agg-rec" style="color: #4ade80;">—</div>
                         </div>
                     </div>
                 </div>

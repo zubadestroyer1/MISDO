@@ -1,4 +1,5 @@
 torch>=2.0
+torchvision
 gymnasium
 stable-baselines3
 einops
@@ -6,3 +7,7 @@ scipy
 numpy
 matplotlib
 flask
+timm
+pystac-client
+planetary-computer
+rasterio

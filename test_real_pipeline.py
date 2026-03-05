@@ -100,7 +100,7 @@ def main() -> None:
         weight_path = os.path.join(weights_dir, f"{name}_model.pt")
         if os.path.exists(weight_path):
             state = torch.load(weight_path, map_location=device, weights_only=True)
-            model.load_state_dict(state)
+            model.load_state_dict(state, strict=False)
             trained = "✓ trained"
         else:
             trained = "✗ random"

@@ -32,10 +32,10 @@ const LOCATIONS = {
 };
 
 const MODEL_INFO = [
-    { name: 'FireRiskNet', icon: '🔥', source: 'VIIRS VNP14IMG', params: '4.03M' },
-    { name: 'ForestLossNet', icon: '🌲', source: 'Hansen GFC', params: '1.33M' },
-    { name: 'HydroRiskNet', icon: '💧', source: 'SRTM/HydroSHEDS', params: '4.59M' },
-    { name: 'SoilRiskNet', icon: '🏜', source: 'SMAP L3', params: '3.88M' },
+    { name: 'FireRiskNet', icon: '🔥', source: 'VIIRS VNP14IMG', params: '~34M' },
+    { name: 'ForestLossNet', icon: '🌲', source: 'Hansen GFC', params: '~34M' },
+    { name: 'HydroRiskNet', icon: '💧', source: 'SRTM/HydroSHEDS', params: '~34M' },
+    { name: 'SoilRiskNet', icon: '🏜', source: 'SMAP L3', params: '~34M' },
 ];
 
 // ═══════════════════════════════════════════════════════════════
@@ -124,6 +124,12 @@ async function loadAgentMasks() {
             setImage(`agent-img-${i}`, mask.image);
             renderStats(`agent-stats-${i}`, mask.stats);
         });
+
+        // Show reference image if available
+        if (data.reference_image) {
+            setImage('reference-img', data.reference_image);
+            document.getElementById('reference-card').style.display = 'block';
+        }
     } catch (err) {
         showToast('Failed to load agent masks', 'error');
         console.error(err);
@@ -180,13 +186,20 @@ async function recalculate() {
         });
         const data = await res.json();
 
-        setImage('agg-img', data.image);
+        // Primary output: recommended zones + safety gradient
+        setImage('agg-recommended-img', data.recommended_image || data.image);
+        setImage('agg-safety-img', data.safety_image || data.image);
+        setImage('agg-img', data.harm_image || data.image);
 
         document.getElementById('agg-min').textContent = data.stats.min;
         document.getElementById('agg-max').textContent = data.stats.max;
         document.getElementById('agg-mean').textContent = data.stats.mean;
         document.getElementById('agg-nogo').textContent = data.stats.no_go_pct + '%';
+        if (data.stats.recommended_pct !== undefined) {
+            document.getElementById('agg-rec').textContent = data.stats.recommended_pct + '%';
+        }
 
+        // Reload env state since it was reset
         loadEnvState();
         showToast(`Aggregation complete — weights [${weights.map(w => w.toFixed(2)).join(', ')}]`, 'success');
     } catch (err) {
@@ -256,20 +269,18 @@ function initForestClick() {
         const img = document.getElementById('env-forest-img');
         const rect = img.getBoundingClientRect();
 
-        const x = (e.clientX - rect.left) / rect.width;
-        const y = (e.clientY - rect.top) / rect.height;
+        // Use offset coordinates relative to the image element itself
+        // This is robust to CSS layout changes — no hardcoded padding needed
+        const x = e.offsetX / img.clientWidth;
+        const y = e.offsetY / img.clientHeight;
 
-        const padLeft = 0.10, padRight = 0.15, padTop = 0.08, padBottom = 0.10;
-        const normX = (x - padLeft) / (1 - padLeft - padRight);
-        const normY = (y - padTop) / (1 - padTop - padBottom);
-
-        if (normX < 0 || normX > 1 || normY < 0 || normY > 1) {
+        if (x < 0 || x > 1 || y < 0 || y > 1) {
             showToast('Click inside the map area', 'info');
             return;
         }
 
-        const col = Math.floor(normX * SPATIAL);
-        const row = Math.floor(normY * SPATIAL);
+        const col = Math.floor(x * SPATIAL);
+        const row = Math.floor(y * SPATIAL);
 
         showToast(`Harvesting at (${row}, ${col})…`, 'info');
 

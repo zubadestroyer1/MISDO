@@ -19,17 +19,18 @@ MISDO fuses satellite data from 4 remote sensing domains (VIIRS fire, Hansen for
 │       │              │              │              │                    │
 │       ▼              ▼              ▼              ▼                    │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐               │
-│  │ FireRisk │  │ Forest   │  │ HydroRisk│  │ SoilRisk │  Domain       │
-│  │ Net      │  │ LossNet  │  │ Net      │  │ Net      │  Models       │
-│  │ ~2.5M    │  │ ~3.2M    │  │ ~3.8M    │  │ ~2.1M    │               │
+│  │ FireRisk │  │ Forest   │  │ HydroRisk│  │ SoilRisk │  ConvNeXt-V2  │
+│  │ Net      │  │ LossNet  │  │ Net      │  │ Net      │  + UNet++     │
+│  │ ~34M     │  │ ~34M     │  │ ~34M     │  │ ~34M     │               │
 │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘               │
 │       │              │              │              │                    │
 │       └──────┬───────┴──────┬───────┘              │                    │
 │              │              │                      │                    │
 │              ▼              ▼                      ▼                    │
 │         ┌─────────────────────────────────────────────┐                 │
-│         │  Conditioned Aggregator                     │  Fusion         │
-│         │  Weighted Sum + Gaussian Smooth + Hard      │                 │
+│         │  Conditioned Aggregator                     │  Hybrid         │
+│         │  Deterministic Weighted Sum + Learned       │  Fusion         │
+│         │  Correction + Gaussian Smooth + Hard        │                 │
 │         │  Constraints (slope, river)                 │                 │
 │         └──────────────────┬──────────────────────────┘                 │
 │                            │                                           │
@@ -45,19 +46,29 @@ MISDO fuses satellite data from 4 remote sensing domains (VIIRS fire, Hansen for
 
 ## Models
 
+All models use a **ConvNeXt-V2 Base** encoder with **UNet++** decoder (nested dense skip connections).
+
 | Model | Architecture | Params | Input | Data Source | Loss |
 |---|---|---|---|---|---|
-| [FireRiskNet](docs/FireRiskNet.md) | ResNet-18 + U-Net | ~2.5M | 6ch (VIIRS I-bands + FRP) | VIIRS VNP14IMG | Focal BCE |
-| [ForestLossNet](docs/ForestLossNet.md) | EfficientNet (MBConv) + PixelShuffle | ~3.2M | 5ch (treecover, lossyear, gain, red, NIR) | Hansen GFC | Dice + BCE |
-| [HydroRiskNet](docs/HydroRiskNet.md) | FPN + Attention Gates | ~3.8M | 5ch (elevation, slope, aspect, flow_acc, flow_dir) | SRTM/HydroSHEDS | Gradient MSE |
-| [SoilRiskNet](docs/SoilRiskNet.md) | ASPP + Dilated Conv | ~2.1M | 4ch (moisture, veg_water, temp, freeze_thaw) | SMAP L3 | Smooth MSE |
+| [FireRiskNet](docs/FireRiskNet.md) | ConvNeXt-V2 + UNet++ | ~34M | 6ch (VIIRS I-bands + FRP) | VIIRS VNP14IMG | Focal BCE |
+| [ForestLossNet](docs/ForestLossNet.md) | ConvNeXt-V2 + UNet++ | ~34M | 5ch (treecover, lossyear, gain, red, NIR) | Hansen GFC | Dice + BCE |
+| [HydroRiskNet](docs/HydroRiskNet.md) | ConvNeXt-V2 + UNet++ | ~34M | 5ch (elevation, slope, aspect, flow_acc, flow_dir) | SRTM/HydroSHEDS | Gradient MSE |
+| [SoilRiskNet](docs/SoilRiskNet.md) | ConvNeXt-V2 + UNet++ | ~34M | 4ch (moisture, veg_water, temp, freeze_thaw) | SMAP L3 | Smooth MSE |
 
-See the [docs/](docs/) directory for detailed architecture diagrams, mathematical formulations, training approaches, and design rationale for each model.
+### Key Architecture Features
+
+- **ConvNeXt-V2 encoder** with Global Response Normalization (GRN) and stochastic depth
+- **UNet++ decoder** with nested dense skip connections and deep supervision
+- **Multi-head temporal attention** for fusing multi-timestep inputs
+- **Cross-domain feature fusion** exchanging information between domain bottlenecks
+- **Hybrid aggregator** — deterministic weighted sum + learnable cross-domain correction
+
+See the [docs/](docs/) directory for detailed architecture documentation.
 
 ### Additional Components
 
-- [Aggregator](docs/Aggregator.md) — Parameter-conditioned spatial risk fusion with Gaussian smoothing and hard constraints
-- [Perception Module](docs/PerceptionModule.md) — Shared ConvNeXt backbone and domain-specific model orchestration
+- [Aggregator](docs/Aggregator.md) — Hybrid deterministic + learnable risk fusion with hard constraints
+- [Perception Module](docs/PerceptionModule.md) — Domain model orchestration with cross-domain fusion
 - [RL Optimizer](docs/RLOptimizer.md) — PPO-based sequential deforestation planning
 
 ---
@@ -79,14 +90,16 @@ python train_models.py --model all --epochs 30
 ### Train a Single Model
 
 ```bash
-python train_models.py --model fire --epochs 50
+python train_models.py --model fire --epochs 50 --samples 128
 ```
 
-### Run the Full Pipeline
+### Training Features
 
-```bash
-python train.py
-```
+- **Data augmentation**: random flips, rotations, brightness jitter
+- **Train/val split**: 80/20 with separate seed ranges
+- **Best checkpoint**: saves model with lowest validation loss
+- **Early stopping**: stops if no improvement for 10 epochs
+- **AdamW optimizer** with cosine annealing and weight decay
 
 ### Start the Web Server
 
@@ -102,12 +115,19 @@ python server.py
 .
 ├── models/
 │   ├── __init__.py           # Model registry
+│   ├── base_model.py         # Shared base model architecture
+│   ├── backbone.py           # ConvNeXt-V2 encoder (shared)
+│   ├── decoders.py           # UNet++ decoder (shared)
 │   ├── fire_model.py         # FireRiskNet
 │   ├── forest_model.py       # ForestLossNet
 │   ├── hydro_model.py        # HydroRiskNet
-│   └── soil_model.py         # SoilRiskNet
+│   ├── soil_model.py         # SoilRiskNet
+│   ├── temporal.py           # Multi-head temporal attention
+│   └── fusion.py             # Cross-domain feature fusion
 ├── datasets/
 │   ├── __init__.py           # Dataset registry
+│   ├── download_earth_data.py# Script for downloading Earth Engine datasets
+│   ├── multi_source_datasets.py# Multi-source real dataset loader
 │   ├── viirs_fire.py         # VIIRS synthetic data
 │   ├── hansen_gfc.py         # Hansen GFC synthetic data
 │   ├── srtm_hydro.py         # SRTM/HydroSHEDS synthetic data
@@ -117,19 +137,12 @@ python server.py
 │   ├── forest_model.pt       # Trained forest model weights
 │   ├── hydro_model.pt        # Trained hydro model weights
 │   └── soil_model.pt         # Trained soil model weights
-├── docs/
-│   ├── FireRiskNet.md        # Fire model documentation
-│   ├── ForestLossNet.md      # Forest model documentation
-│   ├── HydroRiskNet.md       # Hydro model documentation
-│   ├── SoilRiskNet.md        # Soil model documentation
-│   ├── Aggregator.md         # Aggregator documentation
-│   ├── PerceptionModule.md   # Perception module documentation
-│   └── RLOptimizer.md        # RL optimizer documentation
+├── docs/                     # Architecture documentation
 ├── static/                   # Web UI assets
-├── data.py                   # Data ingestion module
-├── perception.py             # Shared backbone + decoder heads
-├── aggregator.py             # Risk fusion module
+├── aggregator.py             # Hybrid risk fusion module
+├── perception.py             # Domain model orchestration
 ├── env.py                    # Gymnasium RL environment
+├── impact.py                 # Cascading impact propagation
 ├── train.py                  # End-to-end PPO training
 ├── train_models.py           # Domain model training script
 ├── server.py                 # Flask web server

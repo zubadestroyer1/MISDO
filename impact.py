@@ -1,6 +1,6 @@
 """
-MISDO — Impact Propagation Module
-====================================
+MISDO — Impact Propagation Module (PyTorch)
+===============================================
 Models how deforestation at one location causes cascading environmental
 damage across the landscape:
 
@@ -8,136 +8,191 @@ damage across the landscape:
 2. Hydrological Cascade: upstream deforestation → downstream water pollution
 3. Cumulative Impact Score: total ecosystem-wide harm from a harvest
 
+Ported from NumPy to PyTorch for GPU acceleration.  All operations
+use batched tensor ops — no Python for-loops over pixels.
+
 This module sits between the Aggregator and the RL Environment,
 transforming the static harm mask into a dynamic impact surface.
 """
 
 from __future__ import annotations
 
-import numpy as np
-from scipy.ndimage import gaussian_filter, label, binary_dilation
+import math
 from typing import Dict, Optional
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor
+
+
+def _make_gaussian_kernel_2d(sigma: float, truncate: float = 4.0) -> Tensor:
+    """Create a 2D Gaussian kernel matching scipy.ndimage.gaussian_filter."""
+    radius = int(truncate * sigma + 0.5)
+    ks = 2 * radius + 1
+    ax = torch.arange(ks, dtype=torch.float32) - radius
+    xx, yy = torch.meshgrid(ax, ax, indexing="ij")
+    kernel = torch.exp(-(xx ** 2 + yy ** 2) / (2.0 * sigma ** 2))
+    kernel = kernel / kernel.sum()
+    return kernel.unsqueeze(0).unsqueeze(0)  # [1, 1, K, K]
+
+
+def _gaussian_blur(x: Tensor, kernel: Tensor) -> Tensor:
+    """Apply Gaussian blur to a 2D tensor [H, W] using a precomputed kernel."""
+    pad = kernel.shape[-1] // 2
+    x_4d = x.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+    kernel = kernel.to(x.device, x.dtype)
+    out = F.conv2d(F.pad(x_4d, (pad, pad, pad, pad), mode="reflect"), kernel)
+    return out.squeeze(0).squeeze(0)  # [H, W]
+
+
+# D8 direction offsets indexed 0-8 (0 = no flow / pit)
+_D8_DY = torch.tensor([0, -1, -1, -1, 0, 0, 1, 1, 1], dtype=torch.long)
+_D8_DX = torch.tensor([0, -1, 0, 1, -1, 1, -1, 0, 1], dtype=torch.long)
 
 
 class ImpactPropagation:
     """Computes cascading environmental impact from deforestation events.
 
+    All computations use PyTorch tensors for GPU compatibility.
+
     Parameters
     ----------
-    flow_accumulation : np.ndarray [H, W]
+    flow_accumulation : Tensor or ndarray [H, W]
         Flow accumulation network (from SRTM/terrain). Higher values =
         more upstream area draining through that pixel.
-    slope : np.ndarray [H, W]
+    slope : Tensor or ndarray [H, W]
         Terrain slope in [0, 1].
+    flow_direction : Tensor or ndarray [H, W] or None
+        D8 flow direction codes normalised to [0, 1] (divide by 8).
+    device : str or torch.device
+        Device to place tensors on.
     """
 
     def __init__(
         self,
-        flow_accumulation: np.ndarray,
-        slope: np.ndarray,
+        flow_accumulation,
+        slope,
+        flow_direction=None,
         contagion_sigma: float = 8.0,
         contagion_decay: float = 0.3,
         hydro_sigma: float = 12.0,
         hydro_weight: float = 0.4,
         erosion_weight: float = 0.3,
+        device: str | torch.device = "cpu",
     ) -> None:
-        self.flow_acc = flow_accumulation.astype(np.float32)
-        self.slope = slope.astype(np.float32)
+        self.device = torch.device(device)
+        self.flow_acc = self._to_tensor(flow_accumulation)
+        self.slope = self._to_tensor(slope)
+
+        # Decode normalised flow direction to integer D8 codes
+        if flow_direction is not None:
+            fd = self._to_tensor(flow_direction)
+            self.flow_dir = torch.round(fd * 8.0).to(torch.long)
+        else:
+            self.flow_dir = None
+
         self.contagion_sigma = contagion_sigma
         self.contagion_decay = contagion_decay
         self.hydro_sigma = hydro_sigma
         self.hydro_weight = hydro_weight
         self.erosion_weight = erosion_weight
 
+        # Precompute Gaussian kernels
+        self._contagion_kernel = _make_gaussian_kernel_2d(contagion_sigma).to(self.device)
+        self._hydro_kernel = _make_gaussian_kernel_2d(hydro_sigma).to(self.device)
+
+    def _to_tensor(self, x) -> Tensor:
+        """Convert ndarray or tensor to float32 on self.device."""
+        if isinstance(x, Tensor):
+            return x.to(device=self.device, dtype=torch.float32)
+        import numpy as np
+        return torch.from_numpy(np.asarray(x, dtype=np.float32)).to(self.device)
+
     def compute_forest_contagion(
         self,
-        forest_state: np.ndarray,
-        newly_cleared: np.ndarray,
-    ) -> np.ndarray:
+        forest_state: Tensor,
+        newly_cleared: Tensor,
+    ) -> Tensor:
         """Compute forest loss contagion from newly cleared areas.
 
         Areas near recent clearing have elevated deforestation risk
         (edge drying, wind exposure, road access effects).
 
-        Parameters
-        ----------
-        forest_state : np.ndarray [H, W]
-            Current forest state (1=intact, 0=cleared).
-        newly_cleared : np.ndarray [H, W]
-            Boolean mask of newly cleared pixels.
-
         Returns
         -------
-        contagion_risk : np.ndarray [H, W]
-            Additional deforestation risk from proximity to clearings.
+        contagion_risk : Tensor [H, W] in [0, 1]
         """
-        # Diffuse clearing signal spatially
-        clearing_signal = newly_cleared.astype(np.float32)
-        diffused = gaussian_filter(clearing_signal, sigma=self.contagion_sigma)
+        forest_state = self._to_tensor(forest_state)
+        newly_cleared = self._to_tensor(newly_cleared)
 
-        # Only applies to remaining forested areas
+        diffused = _gaussian_blur(newly_cleared, self._contagion_kernel)
         contagion = diffused * forest_state * self.contagion_decay
-
-        return np.clip(contagion, 0, 1).astype(np.float32)
+        return contagion.clamp(0, 1)
 
     def compute_hydro_cascade(
         self,
-        forest_state: np.ndarray,
-        newly_cleared: np.ndarray,
-    ) -> np.ndarray:
+        forest_state: Tensor,
+        newly_cleared: Tensor,
+    ) -> Tensor:
         """Compute downstream water pollution from upstream deforestation.
 
-        Deforested areas contribute sediment/nutrient runoff that
-        propagates downstream through the flow accumulation network.
-
-        Parameters
-        ----------
-        forest_state : np.ndarray [H, W]
-            Current forest state.
-        newly_cleared : np.ndarray [H, W]
-            Boolean mask of newly cleared pixels.
+        Uses batched D8 flow direction routing (no Python for-loops over
+        pixels). Falls back to Gaussian diffusion if no flow direction.
 
         Returns
         -------
-        pollution : np.ndarray [H, W]
-            Downstream water pollution intensity.
+        pollution : Tensor [H, W]
         """
+        forest_state = self._to_tensor(forest_state)
+        newly_cleared = self._to_tensor(newly_cleared)
+
         # Erosion source: cleared areas on slopes
-        erosion_source = newly_cleared.astype(np.float32) * self.slope
+        erosion_source = newly_cleared * self.slope
 
-        # Propagate downstream via flow accumulation
-        # (approximate: convolve erosion source with flow-weighted kernel)
-        weighted_erosion = erosion_source * (1.0 + self.flow_acc * 3.0)
-        pollution = gaussian_filter(weighted_erosion, sigma=self.hydro_sigma)
+        if erosion_source.max() < 1e-8:
+            return torch.zeros_like(erosion_source)
 
-        # Normalise
+        H, W = erosion_source.shape
+        pollution = erosion_source.clone()
+
+        if self.flow_dir is not None:
+            # ── Batched D8 routing (GPU-friendly) ──
+            # Each iteration moves pollution one pixel downstream along D8.
+            # All 8 direction codes are processed in parallel via masking.
+            n_steps = max(H, W) // 4
+            decay = 0.85
+
+            for _ in range(n_steps):
+                new_pollution = torch.zeros_like(pollution)
+                for code in range(1, 9):
+                    dy = _D8_DY[code].item()
+                    dx = _D8_DX[code].item()
+                    dir_mask = (self.flow_dir == code).float()
+                    contribution = pollution * dir_mask * decay
+                    # Shift to downstream neighbour using torch.roll
+                    shifted = torch.roll(torch.roll(contribution, dy, 0), dx, 1)
+                    new_pollution = new_pollution + shifted
+                pollution = pollution + new_pollution
+        else:
+            # ── Fallback: Gaussian diffusion ──
+            pollution = _gaussian_blur(pollution, self._hydro_kernel)
+
+        # Normalise to [0, 1]
         max_val = pollution.max()
         if max_val > 0:
             pollution = pollution / max_val
 
-        return (pollution * self.hydro_weight).astype(np.float32)
+        return pollution * self.hydro_weight
 
     def compute_cumulative_impact(
         self,
-        harm_mask: np.ndarray,
-        forest_state: np.ndarray,
-        newly_cleared: np.ndarray,
-    ) -> Dict[str, np.ndarray]:
+        harm_mask,
+        forest_state,
+        newly_cleared,
+    ) -> Dict[str, Tensor]:
         """Compute total ecosystem impact from a deforestation event.
 
-        Combines:
-        1. Direct harm (from aggregated risk models)
-        2. Forest loss contagion (spatial diffusion)
-        3. Hydrological cascade (downstream pollution)
-
-        Parameters
-        ----------
-        harm_mask : np.ndarray [H, W]
-            Base harm mask from aggregator.
-        forest_state : np.ndarray [H, W]
-            Current forest state.
-        newly_cleared : np.ndarray [H, W]
-            Boolean mask of newly cleared pixels.
+        Accepts both Tensors and ndarrays (auto-converted).
 
         Returns
         -------
@@ -147,25 +202,27 @@ class ImpactPropagation:
             'pollution': water pollution cascade [H, W]
             'direct_harm': original harm mask [H, W]
         """
+        harm_mask = self._to_tensor(harm_mask)
+        forest_state = self._to_tensor(forest_state)
+        newly_cleared = self._to_tensor(newly_cleared)
+
         contagion = self.compute_forest_contagion(forest_state, newly_cleared)
         pollution = self.compute_hydro_cascade(forest_state, newly_cleared)
 
-        # Combine: direct + contagion + pollution
-        total = harm_mask + contagion + pollution
-        total = np.clip(total, 0, 1)
+        total = (harm_mask + contagion + pollution).clamp(0, 1)
 
         return {
-            "total_impact": total.astype(np.float32),
-            "contagion": contagion.astype(np.float32),
-            "pollution": pollution.astype(np.float32),
-            "direct_harm": harm_mask.astype(np.float32),
+            "total_impact": total,
+            "contagion": contagion,
+            "pollution": pollution,
+            "direct_harm": harm_mask,
         }
 
     def compute_total_ecosystem_score(
         self,
-        harm_mask: np.ndarray,
-        forest_state: np.ndarray,
-        newly_cleared: np.ndarray,
+        harm_mask,
+        forest_state,
+        newly_cleared,
     ) -> Dict[str, float]:
         """Compute scalar ecosystem health metrics.
 
@@ -175,20 +232,22 @@ class ImpactPropagation:
             'direct_harm_sum': sum of harm in cleared area
             'contagion_risk': total risk of secondary deforestation
             'downstream_pollution': total downstream water quality impact
-            'fragmentation_score': number of forest fragments created
+            'fragmentation_score': number of forest fragments
             'total_ecosystem_cost': weighted sum of all impacts
         """
-        impact = self.compute_cumulative_impact(
-            harm_mask, forest_state, newly_cleared
-        )
+        harm_mask = self._to_tensor(harm_mask)
+        forest_state = self._to_tensor(forest_state)
+        newly_cleared = self._to_tensor(newly_cleared)
+
+        impact = self.compute_cumulative_impact(harm_mask, forest_state, newly_cleared)
 
         direct = float(harm_mask[newly_cleared > 0.5].sum())
         contagion_total = float(impact["contagion"].sum())
         pollution_total = float(impact["pollution"].sum())
 
-        # Fragmentation
-        struct = np.ones((3, 3), dtype=bool)
-        _, n_frags = label(forest_state > 0.5, structure=struct)
+        # Fragmentation: count connected components using a flood-fill approach
+        # (pure PyTorch — no scipy dependency)
+        n_frags = self._count_components(forest_state > 0.5)
 
         total_cost = (
             direct
@@ -205,19 +264,65 @@ class ImpactPropagation:
             "total_ecosystem_cost": round(total_cost, 4),
         }
 
+    @staticmethod
+    def _count_components(mask: Tensor) -> int:
+        """Count connected components in a boolean mask (8-connectivity).
 
+        Uses iterative morphological flood fill — pure PyTorch, no scipy.
+        Slower than scipy.ndimage.label but runs on GPU.
+        """
+        # For moderate sizes, fall back to scipy if available for speed
+        try:
+            from scipy.ndimage import label as scipy_label
+            import numpy as np
+            struct = np.ones((3, 3), dtype=bool)
+            _, n = scipy_label(mask.cpu().numpy(), structure=struct)
+            return int(n)
+        except ImportError:
+            pass
+
+        # Pure-torch fallback: iterative dilation-based component counting
+        remaining = mask.clone().bool()
+        count = 0
+        kernel = torch.ones(1, 1, 3, 3, device=mask.device, dtype=torch.float32)
+        while remaining.any():
+            # Pick first True pixel as seed
+            idx = remaining.nonzero(as_tuple=False)[0]
+            seed = torch.zeros_like(remaining, dtype=torch.float32)
+            seed[idx[0], idx[1]] = 1.0
+            # Iteratively dilate to flood fill
+            prev_sum = 0.0
+            while True:
+                dilated = F.conv2d(
+                    seed.unsqueeze(0).unsqueeze(0),
+                    kernel,
+                    padding=1,
+                )
+                seed = ((dilated.squeeze() > 0) & remaining).float()
+                cur_sum = seed.sum().item()
+                if cur_sum == prev_sum:
+                    break
+                prev_sum = cur_sum
+            remaining = remaining & ~(seed > 0)
+            count += 1
+        return count
+
+
+# ---------------------------------------------------------------------------
+# Quick smoke test
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     H, W = 256, 256
-    flow = np.random.rand(H, W).astype(np.float32) * 0.5
-    slope = np.random.rand(H, W).astype(np.float32) * 0.3
+    flow = torch.rand(H, W) * 0.5
+    slope = torch.rand(H, W) * 0.3
 
     ip = ImpactPropagation(flow, slope)
 
-    forest = np.ones((H, W), dtype=np.float32)
-    harm = np.random.rand(H, W).astype(np.float32) * 0.5
+    forest = torch.ones(H, W)
+    harm = torch.rand(H, W) * 0.5
 
     # Simulate a clearing
-    cleared = np.zeros((H, W), dtype=np.float32)
+    cleared = torch.zeros(H, W)
     cleared[100:110, 100:110] = 1.0
     forest[100:110, 100:110] = 0.0
 
@@ -230,3 +335,14 @@ if __name__ == "__main__":
     scores = ip.compute_total_ecosystem_score(harm, forest, cleared)
     for k, v in scores.items():
         print(f"  {k}: {v}")
+
+    # Test numpy interop (backward compat with env.py)
+    import numpy as np
+    np_harm = np.random.rand(H, W).astype(np.float32) * 0.5
+    np_forest = np.ones((H, W), dtype=np.float32)
+    np_cleared = np.zeros((H, W), dtype=np.float32)
+    np_cleared[50:60, 50:60] = 1.0
+    np_forest[50:60, 50:60] = 0.0
+
+    impact2 = ip.compute_cumulative_impact(np_harm, np_forest, np_cleared)
+    print(f"\nNumPy interop OK: {type(impact2['total_impact'])}")

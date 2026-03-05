@@ -3,26 +3,27 @@ MISDO Module 5 — End-to-End Execution & PPO Training
 ======================================================
 Wires all modules together:
     MockEODataset → MISDOPerception → ConditionedAggregator →
-    DeforestationEnv → PPO (Stable-Baselines3)
+    DeforestationEnv (+ ImpactPropagation) → PPO (Stable-Baselines3)
 
-Includes a custom CNN ``BaseFeaturesExtractor`` for the [3, 256, 256] obs.
+Includes a custom CNN ``BaseFeaturesExtractor`` for the [5, 256, 256] obs.
 
 Architecture Note — Custom CNN Feature Extractor
 -------------------------------------------------
-The PPO policy receives a [3, 256, 256] observation consisting of:
-    - Layer 0: Final_Harm_Mask  (pre-computed spatial risk)
-    - Layer 1: Forest_State     (binary, evolves over the episode)
-    - Layer 2: Infrastructure   (binary, evolves over the episode)
+The PPO policy receives a [5, 256, 256] observation consisting of:
+    - Layer 0: Dynamic_Harm_Mask  (updated each step via ImpactPropagation)
+    - Layer 1: Forest_State       (binary, evolves over the episode)
+    - Layer 2: Infrastructure     (binary, evolves over the episode)
+    - Layer 3: Contagion_Risk     (cumulative forest loss contagion)
+    - Layer 4: Pollution_Risk     (cumulative downstream water pollution)
 
 All heavy spatial reasoning (multi-modal fusion, non-linear aggregation,
 hard constraints) has already been performed by the Perception backbone and
-Aggregator upstream.  The RL policy therefore only needs to learn *where to
-cut next* given these three summary layers.
+Aggregator upstream.  The RL policy learns *where to cut next* given these
+summary layers, while the ImpactPropagation module inside the env
+dynamically updates the harm and impact surfaces at every step.
 
-A lightweight 3-layer strided-conv CNN (3 → 32 → 64 → 128) progressively
+A lightweight 3-layer strided-conv CNN (5 → 32 → 64 → 128) progressively
 compresses the 256×256 spatial dimensions down to a 1-D feature vector.
-This keeps the policy network small and fast to train, while still giving
-PPO enough spatial context to reason about contiguity and harm gradients.
 """
 
 from __future__ import annotations
@@ -42,7 +43,7 @@ from torch import Tensor
 from data import MockEODataset
 from perception import MISDOPerception
 from aggregator import ConditionedAggregator
-from env import DeforestationEnv, SPATIAL
+from env import DeforestationEnv, SPATIAL, OBS_CHANNELS
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -50,10 +51,10 @@ from env import DeforestationEnv, SPATIAL
 # ═══════════════════════════════════════════════════════════════════════════
 
 class MISDOFeatureExtractor(BaseFeaturesExtractor):
-    """3-layer strided-conv CNN that maps [3, 256, 256] → 1-D feature vector.
+    """3-layer strided-conv CNN that maps [5, 256, 256] → 1-D feature vector.
 
     Architecture:
-        Conv(3→32,  k=8, s=4) → ReLU → 64×64
+        Conv(5→32,  k=8, s=4) → ReLU → 64×64
         Conv(32→64, k=4, s=2) → ReLU → 32×32
         Conv(64→128,k=3, s=2) → ReLU → 16×16
         Flatten → Linear → features_dim
@@ -100,11 +101,14 @@ class MISDOFeatureExtractor(BaseFeaturesExtractor):
 # Pipeline: Dataset → Perception → Aggregator → Harm Mask
 # ═══════════════════════════════════════════════════════════════════════════
 
-def generate_harm_mask(
+def generate_harm_mask_and_terrain(
     device: torch.device = torch.device("cpu"),
-) -> np.ndarray:
+) -> Dict[str, np.ndarray]:
     """Runs one batch through the perception+aggregation pipeline and
-    returns a single [256, 256] harm mask as a NumPy array for the RL env.
+    returns a dict with:
+        'harm_mask': [256, 256] harm mask
+        'flow_accumulation': [256, 256] flow accumulation
+        'slope': [256, 256] terrain slope
     """
     print("[1/3] Generating synthetic EO data ...")
     dataset = MockEODataset(num_samples=1, seed=0)
@@ -128,20 +132,25 @@ def generate_harm_mask(
     user_weights = torch.tensor([[0.9, 0.1, 0.5, 0.2]], device=device)
     # user_weights Shape: [1, 4]
 
-    # Extract slope and river proximity from the 20-channel mock tensor
-    slope = obs_tensor[:, 14:15, :, :]       # SRTM Slope channel
-    river = obs_tensor[:, 18:19, :, :]        # Proximity — Distance to River
+    # Extract terrain channels from the 20-channel mock tensor
+    slope_tensor = obs_tensor[:, 14:15, :, :]       # SRTM Slope channel
+    flow_acc_tensor = obs_tensor[:, 16:17, :, :]     # Flow accumulation channel
+    river = obs_tensor[:, 18:19, :, :]               # Proximity — Distance to River
 
     with torch.no_grad():
         harm_mask: Tensor = aggregator(
             agent_masks, user_weights,
-            slope=slope, river_proximity=river,
+            slope=slope_tensor, river_proximity=river,
         )
     # harm_mask Shape: [1, 1, 256, 256]
     print(f"       Final_Harm_Mask shape: {harm_mask.shape}  "
           f"min={harm_mask.min():.3f}  max={harm_mask.max():.3f}")
 
-    return harm_mask.squeeze(0).squeeze(0).cpu().numpy()  # [256, 256]
+    return {
+        "harm_mask": harm_mask.squeeze(0).squeeze(0).cpu().numpy(),
+        "flow_accumulation": flow_acc_tensor.squeeze(0).squeeze(0).cpu().numpy(),
+        "slope": slope_tensor.squeeze(0).squeeze(0).cpu().numpy(),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -152,15 +161,21 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}\n")
 
-    # --- Step A: compute harm mask ---
-    harm_mask_np: np.ndarray = generate_harm_mask(device=device)
-    # harm_mask_np Shape: [256, 256]
+    # --- Step A: compute harm mask + terrain ---
+    pipeline_data = generate_harm_mask_and_terrain(device=device)
+    harm_mask_np = pipeline_data["harm_mask"]
+    flow_acc_np = pipeline_data["flow_accumulation"]
+    slope_np = pipeline_data["slope"]
 
-    # --- Step B: create Gymnasium environment ---
-    print("\n[ENV] Initialising DeforestationEnv ...")
-    env = DeforestationEnv(harm_mask=harm_mask_np)
+    # --- Step B: create Gymnasium environment with ImpactPropagation ---
+    print("\n[ENV] Initialising DeforestationEnv (with ImpactPropagation) ...")
+    env = DeforestationEnv(
+        harm_mask=harm_mask_np,
+        flow_accumulation=flow_acc_np,
+        slope=slope_np,
+    )
     obs, info = env.reset(seed=42)
-    print(f"       Obs shape: {obs.shape}")  # [3, 256, 256]
+    print(f"       Obs shape: {obs.shape}")  # [5, 256, 256]
 
     # --- Step C: initialise PPO with custom feature extractor ---
     print("\n[PPO] Creating PPO agent with MISDOFeatureExtractor ...")

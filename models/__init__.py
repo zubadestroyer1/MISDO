@@ -4,11 +4,14 @@ MISDO Models Package — Domain-Specific Risk Networks
 Each sub-module provides a dataset-specific neural network that maps
 raw satellite channels to a per-pixel risk mask [B, 1, 256, 256].
 
+All models use ConvNeXt-V2 Base encoder (96→192→384→768) with
+UNet++ decoder and nested dense skip connections.
+
 Models:
-    FireRiskNet    — VIIRS active-fire detection      (6 input channels)
-    ForestLossNet  — Hansen deforestation detection    (5 input channels)
-    HydroRiskNet   — SRTM/HydroSHEDS water-pollution  (5 input channels)
-    SoilRiskNet    — SMAP soil degradation             (4 input channels)
+    FireRiskNet    — VIIRS active-fire detection      (6 input channels, ~28M params)
+    ForestLossNet  — Hansen deforestation detection    (5 input channels, ~28M params)
+    HydroRiskNet   — SRTM/HydroSHEDS water-pollution  (5 input channels, ~28M params)
+    SoilRiskNet    — SMAP soil degradation             (4 input channels, ~28M params)
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ from typing import Dict, Type
 
 import torch.nn as nn
 
+from .base_model import DomainRiskNet
 from .fire_model import FireRiskNet
 from .forest_model import ForestLossNet
 from .hydro_model import HydroRiskNet

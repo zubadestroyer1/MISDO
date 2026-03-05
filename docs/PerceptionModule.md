@@ -1,96 +1,50 @@
-# Perception Module — Shared Backbone & Agent Decoders
+# Perception Module — Domain Model Orchestration
 
 ## Overview
 
-The **Perception Module** is the shared spatial-reasoning backbone that converts raw multi-modal satellite data into risk masks for each environmental domain. Two variants exist:
+The Perception Module orchestrates all 4 domain-specific ConvNeXt-V2 + UNet++ models and optionally fuses their bottleneck features via cross-domain attention before decoding.
 
-1. **MISDOPerception** — ConvNeXt-Tiny backbone with 4 lightweight U-Net decoder heads (legacy, 20-channel unified input)
-2. **RealMISDOPerception** — Loads the 4 trained domain-specific models and stacks their outputs (production pipeline)
+## Implementations
 
----
+### RealMISDOPerception (primary)
 
-## MISDOPerception (Legacy / Unified Pipeline)
-
-| Property | Value |
-|---|---|
-| **Backbone** | ConvNeXt-Tiny (3-stage) |
-| **Decoder Heads** | 4 × DecoderHead (hydrology, biodiversity, climate, fire) |
-| **Input** | `[B, 20, 256, 256]` — all 20 EO channels |
-| **Output** | `[B, 4, 256, 256]` — stacked risk masks |
-
-### ConvNeXt Backbone Architecture
+Loads 4 trained domain models and runs them in a 3-phase pipeline:
 
 ```
-Input [B, 20, 256, 256]
-  │
-  ▼
-Stem: Conv2d(20→64, k=4, s=2) + GN          → [B, 64, 128, 128]
-  │
-  ▼
-Stage 1: GN → Conv(64→128, k=2, s=2)
-         ConvNeXtBlock(128) × 2               → [B, 128, 64, 64]
-  │
-  ▼
-Stage 2: Conv(128→256, k=1)
-         ConvNeXtBlock(256) × 2               → [B, 256, 64, 64]
+Phase 1: Encode     — Run each model's ConvNeXt-V2 encoder
+Phase 2: Fuse       — CrossDomainFusion exchanges bottleneck info
+Phase 3: Decode     — Each model's UNet++ decodes from enriched features
 ```
 
-### ConvNeXt Block
+**Input**: Dict of domain tensors `{"fire": [B,6,H,W], "forest": [B,5,H,W], "hydro": [B,5,H,W], "soil": [B,4,H,W]}`
 
-```
-x ──┬── DWConv7×7(C, C, groups=C)  [depth-wise conv]
-    │── GroupNorm(1, C)              [per-channel LayerNorm equivalent]
-    │── Conv1×1(C, 4C)              [expand]
-    │── GELU
-    │── Conv1×1(4C, C)              [project]
-    └── + (residual)
-```
+**Output**: Stacked risk masks `[B, 4, 256, 256]`
 
-### Decoder Head (shared architecture, independent weights)
+### CrossDomainFusion
 
-Each domain has its own DecoderHead mapping `[B, 256, 64, 64]` → `[B, 1, 256, 256]`:
+Lightweight feature fusion (~40K params) that exchanges information between the 4 domain bottlenecks:
 
-```
-ConvTranspose2d(256→128, k=2, s=2) + GN + GELU  → [B, 128, 128, 128]
-ConvTranspose2d(128→64, k=2, s=2)  + GN + GELU  → [B, 64, 256, 256]
-Conv2d(64→1, k=1) + Sigmoid                     → [B, 1, 256, 256]
-```
+1. Project each domain to shared 96-dim space (1×1 conv)
+2. Concatenate all 4 projected features
+3. Apply cross-attention (2-layer 1×1 conv network)
+4. Per-domain gating (softmax across domains)
+5. Add as residual back to each domain's bottleneck
 
----
+Near-zero initialized — starts as identity, learns to contribute during training.
 
-## RealMISDOPerception (Production Pipeline)
+### MISDOPerception (legacy)
 
-| Property | Value |
-|---|---|
-| **Architecture** | 4 independent domain-specific models |
-| **Input** | `Dict` of domain tensors (each with domain-specific channel count) |
-| **Output** | `[B, 4, 256, 256]` — stacked risk masks |
+Legacy shared ConvNeXt-Tiny backbone with 4 decoder heads for backward compatibility.
 
-This variant loads `FireRiskNet`, `ForestLossNet`, `HydroRiskNet`, and `SoilRiskNet` as independent sub-models, each with their own trained weights. This is the production configuration — each model processes only its domain-specific input.
+**Input**: `[B, 20, 256, 256]` (20-channel mock data)
 
-### Weight Loading
+**Output**: `[B, 4, 256, 256]`
 
-```python
-for name in ["fire", "forest", "hydro", "soil"]:
-    path = f"weights/{name}_model.pt"
-    state = torch.load(path, map_location="cpu", weights_only=True)
-    self.sub_models[name].load_state_dict(state)
-```
+## Total Parameters
 
----
-
-## Why ConvNeXt for the Shared Backbone?
-
-1. **Modern Architecture**: ConvNeXt achieves ResNet-level performance with pure convolutions — no attention, no transformers. This keeps inference fast on CPU/MPS.
-2. **Depth-wise Convolutions**: 7×7 depthwise convs match the spatial correlation scale of satellite imagery.
-3. **Shared Features**: A single backbone amortises feature extraction across 4 domains — spectral patterns (vegetation reflectance, thermal anomalies) are shared between fire and forest models.
-4. **Decoupled Decoders**: Each domain head has independent weights, so domain-specific signals (fire hotspots vs. forest boundaries) are decoded separately.
-
----
-
-## Why Domain-Specific Models in Production?
-
-The legacy MISDOPerception requires all 20 channels simultaneously. In practice, each satellite source arrives at different times and resolutions. `RealMISDOPerception` with domain-specific sub-models allows:
-1. **Independent updates**: Retrain one model without affecting others
-2. **Domain-specific architectures**: Each model uses the optimal architecture for its data
-3. **Flexible input**: Each model takes only its relevant channels
+| Component | Parameters |
+|-----------|-----------|
+| 4× ConvNeXt-V2 + UNet++ models | ~136M total (~34M each) |
+| CrossDomainFusion | ~40K |
+| TemporalAttention (per model) | ~4.5M each |
+| **Total** | ~136M |

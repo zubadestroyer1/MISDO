@@ -53,6 +53,8 @@ _using_real_models: bool = False
 # Hard constraint tensors extracted from real domain data
 _slope_tensor: Optional[Tensor] = None       # [1, 1, 256, 256]
 _river_prox_tensor: Optional[Tensor] = None  # [1, 1, 256, 256]
+_flow_dir_tensor: Optional[Tensor] = None    # [1, 1, 256, 256] — D8 flow direction
+_forest_mask_tensor: Optional[Tensor] = None # [1, 1, 256, 256] — 1=forested, 0=non-forest
 
 # Head metadata — updated for real models
 HEAD_NAMES: List[str] = ["Fire Risk", "Forest Loss", "Water Pollution", "Soil Degradation"]
@@ -66,23 +68,28 @@ HEAD_DESCRIPTIONS: List[str] = [
 
 
 def _extract_hard_constraints(domain_tensors: Dict[str, Tensor]) -> None:
-    """Extract slope and river proximity from real SRTM hydro domain data.
+    """Extract slope, river proximity, and forest presence from real domain data.
 
-    SRTM hydro channels:
-        0: elevation, 1: slope, 2: aspect, 3: flow_accumulation, 4: flow_direction
-
-    We use:
-        - slope (channel 1) for steep terrain no-go zones
-        - flow_accumulation (channel 3) as a proxy for river proximity
+    SRTM hydro channels: 0=elevation, 1=slope, 2=aspect, 3=flow_accumulation, 4=flow_direction
+    Hansen GFC channels: 0=treecover2000, 1=lossyear, 2=gain, 3=red, 4=NIR
     """
-    global _slope_tensor, _river_prox_tensor
+    global _slope_tensor, _river_prox_tensor, _flow_dir_tensor, _forest_mask_tensor
 
     hydro = domain_tensors["hydro"]  # [1, 5, 256, 256]
     _slope_tensor = hydro[:, 1:2, :, :].clone()           # [1, 1, 256, 256]
     _river_prox_tensor = hydro[:, 3:4, :, :].clone()      # [1, 1, 256, 256]
+    _flow_dir_tensor = hydro[:, 4:5, :, :].clone()        # [1, 1, 256, 256] — D8 flow direction
 
+    # Forest presence from Hansen treecover2000 (channel 0)
+    # Pixels with >20% canopy cover are considered forest
+    forest = domain_tensors["forest"]  # [1, 5, 256, 256]
+    _forest_mask_tensor = (forest[:, 0:1, :, :] > 0.2).float()  # [1, 1, 256, 256]
+
+    forest_pct = _forest_mask_tensor.mean().item() * 100
     print(f"  [Constraints] slope range: [{_slope_tensor.min():.3f}, {_slope_tensor.max():.3f}]")
     print(f"  [Constraints] river_prox range: [{_river_prox_tensor.min():.3f}, {_river_prox_tensor.max():.3f}]")
+    print(f"  [Constraints] flow_dir range: [{_flow_dir_tensor.min():.3f}, {_flow_dir_tensor.max():.3f}]")
+    print(f"  [Constraints] forest cover: {forest_pct:.1f}%")
 
 
 def _init_models() -> None:
@@ -151,16 +158,23 @@ def _init_real_models(weights_dir: str) -> None:
         harm = _aggregator(
             _agent_masks, default_weights,
             slope=_slope_tensor, river_proximity=_river_prox_tensor,
+            forest_mask=_forest_mask_tensor,
         )
     harm_np = harm.squeeze().cpu().numpy()
 
     print("[INIT] Initializing Impact Propagation ...")
     slope_np = _slope_tensor.squeeze().cpu().numpy() if _slope_tensor is not None else np.zeros((256, 256))
     flow_np = _river_prox_tensor.squeeze().cpu().numpy() if _river_prox_tensor is not None else np.zeros((256, 256))
-    _impact = ImpactPropagation(flow_accumulation=flow_np, slope=slope_np)
+    flow_dir_np = _flow_dir_tensor.squeeze().cpu().numpy() if _flow_dir_tensor is not None else None
+    _impact = ImpactPropagation(flow_accumulation=flow_np, slope=slope_np, flow_direction=flow_dir_np)
 
-    print("[INIT] Initializing RL Environment ...")
-    _env = DeforestationEnv(harm_mask=harm_np)
+    print("[INIT] Initializing RL Environment (with ImpactPropagation) ...")
+    _env = DeforestationEnv(
+        harm_mask=harm_np,
+        flow_accumulation=flow_np,
+        slope=slope_np,
+        flow_direction=flow_dir_np,
+    )
     _env.reset(seed=42)
     print("[INIT] Ready (REAL models).\n")
 
@@ -192,8 +206,16 @@ def _init_legacy_models() -> None:
         harm = _aggregator(_agent_masks, default_weights, slope=slope, river_proximity=river)
     harm_np = harm.squeeze().cpu().numpy()
 
-    print("[INIT] Initializing RL Environment ...")
-    _env = DeforestationEnv(harm_mask=harm_np)
+    # Extract terrain for ImpactPropagation
+    slope_np = slope.squeeze().cpu().numpy() if slope is not None else np.zeros((256, 256))
+    flow_np = _obs_tensor[:, 16:17, :, :].squeeze().cpu().numpy() if _obs_tensor is not None else np.zeros((256, 256))
+
+    print("[INIT] Initializing RL Environment (with ImpactPropagation) ...")
+    _env = DeforestationEnv(
+        harm_mask=harm_np,
+        flow_accumulation=flow_np,
+        slope=slope_np,
+    )
     _env.reset(seed=42)
     print("[INIT] Ready (legacy models).\n")
 
@@ -207,13 +229,47 @@ def _array_to_base64(
     cmap: str = "inferno",
     vmin: float = 0.0,
     vmax: float = 1.0,
+    title: str = "",
+    cbar_label: str = "Risk",
 ) -> str:
-    """Render a 2D array as a colormapped PNG and return base64 string."""
-    fig, ax = plt.subplots(1, 1, figsize=(4, 4), dpi=100)
+    """Render a 2D array as a colormapped PNG and return base64 string.
+
+    Includes axis labels (pixel → km at ~30 m resolution), a labelled
+    colorbar explaining the colour scale, and readable white text.
+    """
+    PIXEL_M = 30  # ~30 m/pixel (Landsat/SRTM resolution)
+    H, W = arr.shape
+
+    fig, ax = plt.subplots(1, 1, figsize=(5, 4.5), dpi=110)
+    fig.patch.set_facecolor("#0f0f1a")
+    ax.set_facecolor("#0f0f1a")
+
     im = ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="bilinear")
-    ax.axis("off")
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig.tight_layout(pad=0.5)
+
+    # Axis ticks in km
+    km_ticks_x = np.linspace(0, W - 1, 5)
+    km_labels_x = [f"{int(t * PIXEL_M / 1000)}" for t in km_ticks_x]
+    km_ticks_y = np.linspace(0, H - 1, 5)
+    km_labels_y = [f"{int(t * PIXEL_M / 1000)}" for t in km_ticks_y]
+
+    ax.set_xticks(km_ticks_x)
+    ax.set_xticklabels(km_labels_x, fontsize=8, color="#cccccc")
+    ax.set_yticks(km_ticks_y)
+    ax.set_yticklabels(km_labels_y, fontsize=8, color="#cccccc")
+    ax.set_xlabel("km", fontsize=9, color="#aaaaaa", labelpad=4)
+    ax.set_ylabel("km", fontsize=9, color="#aaaaaa", labelpad=4)
+    ax.tick_params(colors="#666666", length=3, width=0.5)
+
+    if title:
+        ax.set_title(title, fontsize=10, color="white", pad=6, fontweight="bold")
+
+    # Colorbar with label
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.06)
+    cbar.set_label(cbar_label, fontsize=9, color="#cccccc", labelpad=6)
+    cbar.ax.tick_params(labelsize=8, colors="#cccccc", length=3, width=0.5)
+    cbar.outline.set_edgecolor("#444444")
+
+    fig.tight_layout(pad=1.0)
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", facecolor="#0f0f1a")
@@ -225,11 +281,13 @@ def _array_to_base64(
 def _env_state_images() -> Dict[str, Any]:
     """Capture current RL env state as base64 images + stats."""
     assert _env is not None
-    obs = _env._get_obs()  # [3, 256, 256]
+    obs = _env._get_obs()  # [5, 256, 256]
 
-    harm_img = _array_to_base64(obs[0], cmap="inferno")
-    forest_img = _array_to_base64(obs[1], cmap="Greens", vmin=0, vmax=1)
-    infra_img = _array_to_base64(obs[2], cmap="Oranges", vmin=0, vmax=1)
+    harm_img = _array_to_base64(obs[0], cmap="inferno", title="Dynamic Harm Mask", cbar_label="Harm (0=safe, 1=danger)")
+    forest_img = _array_to_base64(obs[1], cmap="Greens", vmin=0, vmax=1, title="Forest State", cbar_label="Cover (1=intact, 0=cleared)")
+    infra_img = _array_to_base64(obs[2], cmap="Oranges", vmin=0, vmax=1, title="Infrastructure", cbar_label="Presence (1=road/cleared)")
+    contagion_img = _array_to_base64(obs[3], cmap="Reds", vmin=0, vmax=1, title="Contagion Risk", cbar_label="Risk (0=none, 1=high)")
+    pollution_img = _array_to_base64(obs[4], cmap="YlGnBu", vmin=0, vmax=1, title="Water Pollution", cbar_label="Pollution (0=clean, 1=severe)")
 
     forest_pct = float(obs[1].sum()) / (SPATIAL * SPATIAL) * 100
     infra_pct = float(obs[2].sum()) / (SPATIAL * SPATIAL) * 100
@@ -238,10 +296,14 @@ def _env_state_images() -> Dict[str, Any]:
         "harm_mask": harm_img,
         "forest_state": forest_img,
         "infrastructure": infra_img,
+        "contagion_risk": contagion_img,
+        "pollution_risk": pollution_img,
         "stats": {
             "forest_remaining_pct": round(forest_pct, 2),
             "infrastructure_pct": round(infra_pct, 2),
             "harvest_count": _env._harvest_count,
+            "contagion_mean": round(float(obs[3].mean()), 4),
+            "pollution_mean": round(float(obs[4].mean()), 4),
         },
     }
 
@@ -261,15 +323,23 @@ def get_agent_masks():
     assert _agent_masks is not None
     masks_np = _agent_masks.squeeze(0).cpu().numpy()  # [4, 256, 256]
 
+    # Colorbar labels per domain
+    HEAD_CBAR_LABELS: List[str] = [
+        "Fire probability",
+        "Loss probability",
+        "Runoff risk",
+        "Degradation risk",
+    ]
+
     result: List[Dict[str, Any]] = []
-    for i, (name, cmap, desc) in enumerate(
-        zip(HEAD_NAMES, HEAD_CMAPS, HEAD_DESCRIPTIONS)
+    for i, (name, cmap, desc, cbar_lbl) in enumerate(
+        zip(HEAD_NAMES, HEAD_CMAPS, HEAD_DESCRIPTIONS, HEAD_CBAR_LABELS)
     ):
         arr = masks_np[i]
         result.append({
             "name": name,
             "description": desc,
-            "image": _array_to_base64(arr, cmap=cmap),
+            "image": _array_to_base64(arr, cmap=cmap, title=name, cbar_label=cbar_lbl),
             "stats": {
                 "min": round(float(arr.min()), 4),
                 "max": round(float(arr.max()), 4),
@@ -277,7 +347,17 @@ def get_agent_masks():
             },
         })
 
-    return jsonify({"masks": result})
+    # Reference image: raw forest canopy cover (no model applied)
+    ref_image = None
+    if _using_real_models and _forest_mask_tensor is not None:
+        ref_arr = _forest_mask_tensor.squeeze().cpu().numpy()
+        ref_image = _array_to_base64(
+            ref_arr, cmap="Greens", vmin=0, vmax=1,
+            title="Reference: Forest Canopy",
+            cbar_label="Canopy cover (1=forest)",
+        )
+
+    return jsonify({"masks": result, "reference_image": ref_image})
 
 
 @app.route("/api/aggregate", methods=["POST"])
@@ -295,31 +375,45 @@ def aggregate():
             harm: Tensor = _aggregator(
                 _agent_masks, weights,
                 slope=_slope_tensor, river_proximity=_river_prox_tensor,
+                forest_mask=_forest_mask_tensor,
             )
         else:
-            # Legacy: use mock data channels for hard constraints
             slope = _obs_tensor[:, 14:15, :, :] if _obs_tensor is not None else None
             river = _obs_tensor[:, 18:19, :, :] if _obs_tensor is not None else None
             harm = _aggregator(_agent_masks, weights, slope=slope, river_proximity=river)
 
     harm_np = harm.squeeze().cpu().numpy()  # [256, 256]
 
-    # Update the RL environment with the new harm mask
+    # Compute safety mask and recommended harvest zones
+    with torch.no_grad():
+        safety_data = _aggregator.compute_safety_mask(
+            harm, forest_mask=_forest_mask_tensor,
+            safety_threshold=0.3,
+        )
+    safety_np = safety_data['safety_mask'].squeeze().cpu().numpy()
+    recommended_np = safety_data['recommended'].squeeze().cpu().numpy()
+
+    # ── Issue 2 fix: FULLY reset the RL environment with new harm mask ──
     assert _env is not None
     _env._base_harm_mask = harm_np.copy()
-    _env._harm_mask = harm_np.copy()
-    # Don't reset forest/infra state — just update the underlying risk surface
+    _env.reset(seed=42)  # Full reset: forest, infra, impact layers
 
     no_go_pct = float((harm_np >= 0.999).sum()) / (SPATIAL * SPATIAL) * 100
+    rec_pct = float(recommended_np.sum()) / (SPATIAL * SPATIAL) * 100
 
     return jsonify({
-        "image": _array_to_base64(harm_np, cmap="inferno"),
+        "harm_image": _array_to_base64(harm_np, cmap="inferno", title="Fused Harm Mask", cbar_label="Harm (0=safe, 1=danger)"),
+        "safety_image": _array_to_base64(safety_np, cmap="RdYlGn", title="Safety Gradient", cbar_label="Safety (1=safest, 0=danger)"),
+        "recommended_image": _array_to_base64(recommended_np, cmap="Greens", vmin=0, vmax=1, title="Recommended Harvest", cbar_label="Harvestable (1=yes)"),
         "stats": {
             "min": round(float(harm_np.min()), 4),
             "max": round(float(harm_np.max()), 4),
             "mean": round(float(harm_np.mean()), 4),
             "no_go_pct": round(no_go_pct, 2),
+            "recommended_pct": round(rec_pct, 2),
         },
+        # Legacy key for backward compat with existing frontend
+        "image": _array_to_base64(harm_np, cmap="inferno", title="Fused Harm Mask", cbar_label="Harm (0=safe, 1=danger)"),
     })
 
 
@@ -349,16 +443,9 @@ def env_step():
         "col": col,
     }
 
-    # Add impact analysis if available
-    if _impact is not None and info.get('valid', False):
-        obs = _env._get_obs()
-        forest_state = obs[1]
-        newly_cleared = np.zeros_like(forest_state)
-        newly_cleared[max(row-5,0):min(row+5,SPATIAL), max(col-5,0):min(col+5,SPATIAL)] = 1.0
-        impact_data = _impact.compute_total_ecosystem_score(
-            obs[0], forest_state, newly_cleared
-        )
-        state['impact'] = impact_data
+    # Use impact scores computed inside env.step() (avoids redundant recalculation)
+    if info.get('valid', False) and 'impact_scores' in info:
+        state['impact'] = info['impact_scores']
 
     return jsonify(state)
 
@@ -442,7 +529,26 @@ def change_location():
                 )
         harm_np = harm.squeeze().cpu().numpy()
 
-        _env = DeforestationEnv(harm_mask=harm_np)
+        # Extract terrain data for ImpactPropagation
+        if _using_real_models and _slope_tensor is not None and _river_prox_tensor is not None:
+            loc_slope = _slope_tensor.squeeze().cpu().numpy()
+            loc_flow = _river_prox_tensor.squeeze().cpu().numpy()
+            loc_flow_dir = _flow_dir_tensor.squeeze().cpu().numpy() if _flow_dir_tensor is not None else None
+        elif _obs_tensor is not None:
+            loc_slope = _obs_tensor[:, 14:15, :, :].squeeze().cpu().numpy()
+            loc_flow = _obs_tensor[:, 16:17, :, :].squeeze().cpu().numpy()
+            loc_flow_dir = None  # legacy mock data has no explicit flow direction
+        else:
+            loc_slope = np.zeros((SPATIAL, SPATIAL), dtype=np.float32)
+            loc_flow = np.zeros((SPATIAL, SPATIAL), dtype=np.float32)
+            loc_flow_dir = None
+
+        _env = DeforestationEnv(
+            harm_mask=harm_np,
+            flow_accumulation=loc_flow,
+            slope=loc_slope,
+            flow_direction=loc_flow_dir,
+        )
         _env.reset(seed=seed)
 
         print(f"[LOCATION] Ready: {location}")
