@@ -50,6 +50,47 @@ _D8_DY = torch.tensor([0, -1, -1, -1, 0, 0, 1, 1, 1], dtype=torch.long)
 _D8_DX = torch.tensor([0, -1, 0, 1, -1, 1, -1, 0, 1], dtype=torch.long)
 
 
+def _shift_2d(x: Tensor, dy: int, dx: int) -> Tensor:
+    """Shift a 2D tensor by (dy, dx) with zero-padding (no wrapping).
+
+    Unlike torch.roll, values shifted off one edge do NOT reappear on
+    the opposite edge.  Vacated positions are filled with zeros.
+
+    Parameters
+    ----------
+    x : Tensor [H, W]
+        Input 2D tensor.
+    dy : int
+        Vertical shift (positive = down, negative = up).
+    dx : int
+        Horizontal shift (positive = right, negative = left).
+
+    Returns
+    -------
+    shifted : Tensor [H, W]
+        Same shape as input with edge values dissipated.
+    """
+    H, W = x.shape
+    result = torch.zeros_like(x)
+
+    # Compute source and destination slices
+    src_y_start = max(0, -dy)
+    src_y_end = min(H, H - dy)
+    src_x_start = max(0, -dx)
+    src_x_end = min(W, W - dx)
+
+    dst_y_start = max(0, dy)
+    dst_y_end = min(H, H + dy)
+    dst_x_start = max(0, dx)
+    dst_x_end = min(W, W + dx)
+
+    if src_y_end > src_y_start and src_x_end > src_x_start:
+        result[dst_y_start:dst_y_end, dst_x_start:dst_x_end] = \
+            x[src_y_start:src_y_end, src_x_start:src_x_end]
+
+    return result
+
+
 class ImpactPropagation:
     """Computes cascading environmental impact from deforestation events.
 
@@ -156,9 +197,11 @@ class ImpactPropagation:
         pollution = erosion_source.clone()
 
         if self.flow_dir is not None:
-            # ── Batched D8 routing (GPU-friendly) ──
+            # ── Batched D8 routing (GPU-friendly, no grid-edge wrapping) ──
             # Each iteration moves pollution one pixel downstream along D8.
             # All 8 direction codes are processed in parallel via masking.
+            # Uses zero-padded slicing instead of torch.roll to prevent
+            # pollution from wrapping across grid boundaries.
             n_steps = max(H, W) // 4
             decay = 0.85
 
@@ -169,8 +212,9 @@ class ImpactPropagation:
                     dx = _D8_DX[code].item()
                     dir_mask = (self.flow_dir == code).float()
                     contribution = pollution * dir_mask * decay
-                    # Shift to downstream neighbour using torch.roll
-                    shifted = torch.roll(torch.roll(contribution, dy, 0), dx, 1)
+
+                    # Zero-padded directional shift (no wrapping)
+                    shifted = _shift_2d(contribution, dy, dx)
                     new_pollution = new_pollution + shifted
                 pollution = pollution + new_pollution
         else:

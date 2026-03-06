@@ -43,6 +43,8 @@ Stage 4 : 384 → 768, stride 2, depth 3       → H/32  (8×8)
 
 - **Data augmentation**: random flips, rotations, brightness jitter
 - **Optimizer**: AdamW (lr=3e-4, weight_decay=1e-4)
-- **Scheduler**: cosine annealing
+- **Scheduler**: warmup cosine annealing
+- **UNet++ deep supervision** auxiliary losses (aux_weight=0.3)
 - **Best checkpoint saving** on validation loss
 - **Early stopping** (patience=10)
+- **NaN-safe losses** with prediction clamping for AMP

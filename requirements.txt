@@ -11,3 +11,4 @@ timm
 pystac-client
 planetary-computer
 rasterio
+Pillow

@@ -6,27 +6,31 @@ with production-grade training features.
 
 Features:
     - Linear LR warmup (first 10% of epochs)
-    - Gradient accumulation (effective batch size 8-16)
+    - Gradient accumulation (effective batch size 16-64 on A100)
     - Data augmentation (random flips + 90° rotations)
-    - Automatic Mixed Precision (AMP) for GPU training
-    - Deep supervision auxiliary losses
-    - Gradient clipping
+    - Automatic Mixed Precision (AMP) for CUDA/MPS
+    - UNet++ deep supervision auxiliary losses
+    - Gradient clipping with max norm
     - Proper epoch timing and logging
     - Checkpoint saving (best model by test loss)
+    - MPS-safe DataLoader settings
 
-Train split: years 2001–2020
-Test split:  years 2021–2023
+Temporal Split Strategy:
+    Train:    spatial "train" tiles, years 2001–2018
+    Test:     spatial "train" tiles, years 2019–2020 (monitoring)
+    Validate: spatial "test" tiles, years 2021–2023 (true hold-out)
 
 Usage:
-    python train_real_models.py --model all --epochs 30
-    python train_real_models.py --model fire --epochs 50
-    python train_real_models.py --model all --epochs 60 --accumulation-steps 8 --amp
+    python train_real_models.py --model all --epochs 60
+    python train_real_models.py --model fire --epochs 80 --amp
+    python train_real_models.py --model all --epochs 60 --accumulation-steps 4 --amp
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -44,6 +48,13 @@ from datasets.real_datasets import (
     RealHansenDataset,
     RealHydroDataset,
     RealSoilDataset,
+)
+from losses import (
+    FocalBCELoss,
+    DiceBCELoss,
+    GradientMSELoss,
+    SmoothMSELoss,
+    DeepSupervisionWrapper,
 )
 from models.fire_model import FireRiskNet
 from models.forest_model import ForestLossNet
@@ -85,55 +96,29 @@ class RandomFlipRotate:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Loss Functions
+# Device Utilities
 # ═══════════════════════════════════════════════════════════════════
 
-class FocalBCE(nn.Module):
-    """Focal Binary Cross-Entropy for sparse fire/loss events."""
-
-    def __init__(self, alpha: float = 0.75, gamma: float = 2.0):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        bce = F.binary_cross_entropy(pred, target, reduction="none")
-        pt = target * pred + (1 - target) * (1 - pred)
-        focal = self.alpha * (1 - pt) ** self.gamma * bce
-        return focal.mean()
+def _get_amp_device_type(device: torch.device) -> str:
+    """Return the correct device type string for torch.amp.autocast."""
+    if device.type == "cuda":
+        return "cuda"
+    elif device.type == "mps":
+        return "mps"
+    return "cpu"
 
 
-class DiceBCE(nn.Module):
-    """Dice + BCE combined loss for segmentation."""
+def _get_dataloader_kwargs(device: torch.device) -> dict:
+    """Return MPS/CUDA-safe DataLoader keyword arguments.
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        bce = F.binary_cross_entropy(pred, target)
-        intersection = (pred * target).sum()
-        dice = 1.0 - (2 * intersection + 1) / (pred.sum() + target.sum() + 1)
-        return bce + dice
-
-
-class GradientMSE(nn.Module):
-    """MSE + gradient loss for spatially smooth predictions."""
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        mse = F.mse_loss(pred, target)
-        pred_dx = pred[:, :, :, 1:] - pred[:, :, :, :-1]
-        target_dx = target[:, :, :, 1:] - target[:, :, :, :-1]
-        pred_dy = pred[:, :, 1:, :] - pred[:, :, :-1, :]
-        target_dy = target[:, :, 1:, :] - target[:, :, :-1, :]
-        grad = F.mse_loss(pred_dx, target_dx) + F.mse_loss(pred_dy, target_dy)
-        return mse + 0.5 * grad
-
-
-class SmoothMSE(nn.Module):
-    """MSE with spatial smoothness penalty."""
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        mse = F.mse_loss(pred, target)
-        smooth = F.mse_loss(pred[:, :, 1:, :], pred[:, :, :-1, :]) + \
-                 F.mse_loss(pred[:, :, :, 1:], pred[:, :, :, :-1])
-        return mse + 0.1 * smooth
+    MPS does not support CUDA-style pinned memory, so pin_memory
+    must be False when using Apple Silicon GPUs.
+    """
+    if device.type == "cuda":
+        return {"num_workers": min(8, os.cpu_count() or 1), "pin_memory": True}
+    # MPS and CPU: no pinned memory, no multiprocessing workers
+    # (MPS + multiprocess workers can cause silent hangs)
+    return {"num_workers": 0, "pin_memory": False}
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -170,7 +155,6 @@ class WarmupCosineScheduler:
             scale = epoch / max(self.warmup_epochs, 1)
         else:
             # Cosine annealing from base_lr → 0
-            import math
             progress = (epoch - self.warmup_epochs) / max(
                 self.total_epochs - self.warmup_epochs, 1
             )
@@ -188,28 +172,28 @@ MODEL_CONFIGS = {
     "fire": {
         "model_cls": FireRiskNet,
         "dataset_cls": RealFireDataset,
-        "loss_cls": FocalBCE,
+        "loss_cls": FocalBCELoss,
         "temporal": True,
         "lr": 3e-4,
     },
     "forest": {
         "model_cls": ForestLossNet,
         "dataset_cls": RealHansenDataset,
-        "loss_cls": DiceBCE,
+        "loss_cls": DiceBCELoss,
         "temporal": True,
         "lr": 3e-4,
     },
     "hydro": {
         "model_cls": HydroRiskNet,
         "dataset_cls": RealHydroDataset,
-        "loss_cls": GradientMSE,
+        "loss_cls": GradientMSELoss,
         "temporal": False,
         "lr": 1e-3,
     },
     "soil": {
         "model_cls": SoilRiskNet,
         "dataset_cls": RealSoilDataset,
-        "loss_cls": SmoothMSE,
+        "loss_cls": SmoothMSELoss,
         "temporal": True,
         "lr": 1e-3,
     },
@@ -225,6 +209,7 @@ def train_single_model(
     device: torch.device,
     accumulation_steps: int = 4,
     use_amp: bool = False,
+    patience: int = 10,
 ) -> dict:
     """Train a single model on real data with production-grade features.
 
@@ -234,29 +219,40 @@ def train_single_model(
         Number of gradient accumulation steps (effective batch = batch_size × steps).
     use_amp : bool
         Enable automatic mixed precision (requires CUDA/MPS).
+    patience : int
+        Early stopping patience — stop training if test loss hasn't
+        improved for this many consecutive epochs (default 10).
     """
-    print(f"\n{'=' * 60}")
-    print(f"  Training {name}")
-    print(f"  Device: {device}  |  AMP: {use_amp}  |  Accumulation: {accumulation_steps}")
-    print(f"{'=' * 60}")
+    # ── Temporal Split Strategy ──────────────────────────────────────
+    # Train:    spatial "train" tiles, years 2001-2018  (year_start=1, end=18)
+    # Test:     spatial "train" tiles, years 2014-2020  (year_start=14, end=20)
+    #           → context uses recent history, TARGET (predicted period)
+    #             is years 2019-2020 which is non-overlapping with train
+    # Validate: spatial "test" tiles,  years 2018-2023  (year_start=18, end=23)
+    #           → true hold-out: unseen locations AND unseen time period
+    # ──────────────────────────────────────────────────────────────────
 
     # Dataset
     DatasetCls = config["dataset_cls"]
     if config["temporal"]:
-        train_ds = DatasetCls(tiles_dir=tiles_dir, split="train", T=5)
-        test_ds = DatasetCls(tiles_dir=tiles_dir, split="test", T=5)
+        train_ds = DatasetCls(tiles_dir=tiles_dir, split="train", T=5, train_end_year=18)
+        test_ds = DatasetCls(tiles_dir=tiles_dir, split="train", T=5, train_end_year=20, year_start=14)
+        val_ds = DatasetCls(tiles_dir=tiles_dir, split="test", T=5, train_end_year=23, year_start=18)
     else:
-        train_ds = DatasetCls(tiles_dir=tiles_dir, split="train")
-        test_ds = DatasetCls(tiles_dir=tiles_dir, split="test")
+        train_ds = DatasetCls(tiles_dir=tiles_dir, split="train", train_end_year=18)
+        test_ds = DatasetCls(tiles_dir=tiles_dir, split="train", train_end_year=20)
+        val_ds = DatasetCls(tiles_dir=tiles_dir, split="test", train_end_year=23)
 
-    batch_size = 2
+    batch_size = 16 if device.type == "cuda" else 2
+    dl_kwargs = _get_dataloader_kwargs(device)
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=min(4, os.cpu_count() or 1), pin_memory=(device.type != "cpu"),
+        train_ds, batch_size=batch_size, shuffle=True, **dl_kwargs,
     )
     test_loader = DataLoader(
-        test_ds, batch_size=batch_size, shuffle=False,
-        num_workers=min(4, os.cpu_count() or 1), pin_memory=(device.type != "cpu"),
+        test_ds, batch_size=batch_size, shuffle=False, **dl_kwargs,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False, **dl_kwargs,
     )
 
     effective_batch = batch_size * accumulation_steps
@@ -265,7 +261,8 @@ def train_single_model(
     model = config["model_cls"]().to(device)
     params = sum(p.numel() for p in model.parameters())
     print(f"  Parameters: {params:,}")
-    print(f"  Train samples: {len(train_ds)}, Test samples: {len(test_ds)}")
+    print(f"  Temporal split: train ≤2018 | test 2014–2020 | validate 2018–2023")
+    print(f"  Train: {len(train_ds)}, Test: {len(test_ds)}, Validate: {len(val_ds)}")
     print(f"  Effective batch size: {effective_batch}")
 
     # Optimizer + Scheduler
@@ -276,20 +273,22 @@ def train_single_model(
     scheduler = WarmupCosineScheduler(optimizer, warmup_epochs, epochs)
     print(f"  Warmup epochs: {warmup_epochs}")
 
-    # Loss + Augmentation
-    criterion = config["loss_cls"]()
+    # Loss + Deep Supervision + Augmentation
+    base_criterion = config["loss_cls"]()
+    criterion = DeepSupervisionWrapper(base_criterion, aux_weight=0.3)
     augment = RandomFlipRotate()
 
-    # AMP scaler (no-op on CPU)
-    scaler = torch.amp.GradScaler(enabled=use_amp and device.type != "cpu")
-
-    # Deep supervision weight for auxiliary losses
-    ds_weight = 0.3
+    # AMP setup — device-aware autocast type
+    amp_device_type = _get_amp_device_type(device)
+    amp_enabled = use_amp and device.type != "cpu"
+    scaler = torch.amp.GradScaler(enabled=amp_enabled)
 
     # Training loop
     train_losses: list[float] = []
     test_losses: list[float] = []
     best_test_loss = float("inf")
+    epochs_without_improvement = 0
+    stopped_epoch = epochs  # will be overwritten if early-stopped
 
     for epoch in range(1, epochs + 1):
         epoch_start = time.time()
@@ -303,21 +302,39 @@ def train_single_model(
         optimizer.zero_grad()
 
         for batch_idx, (obs, target) in enumerate(train_loader):
-            obs = obs.to(device, non_blocking=True)
-            target = target.to(device, non_blocking=True)
+            obs = obs.to(device, non_blocking=dl_kwargs.get("pin_memory", False))
+            target = target.to(device, non_blocking=dl_kwargs.get("pin_memory", False))
 
             # Data augmentation
             obs, target = augment(obs, target)
 
             # Forward pass with optional AMP
-            amp_device_type = "cuda" if device.type == "cuda" else "cpu"
-            with torch.amp.autocast(device_type=amp_device_type, enabled=use_amp):
-                pred = model(obs)
-                # Ensure shapes match
-                if pred.shape != target.shape:
-                    target = target[:, :1]
+            with torch.amp.autocast(device_type=amp_device_type, enabled=amp_enabled):
+                # Forward with deep supervision for auxiliary losses
+                bottleneck, skips = model.encode(obs)
+                features = {"s1": skips["s1"], "s2": skips["s2"], "s3": skips["s3"], "s4": bottleneck}
+                pred_result = model.decoder(features, return_deep=True)
 
-                loss = criterion(pred, target)
+                if isinstance(pred_result, tuple):
+                    pred, deep_outputs = pred_result
+                else:
+                    pred, deep_outputs = pred_result, None
+
+                # Shape assertion
+                assert pred.shape[0] == target.shape[0], (
+                    f"Batch size mismatch: pred {pred.shape} vs target {target.shape}"
+                )
+                # Ensure spatial dims match (resize target if needed)
+                if pred.shape[2:] != target.shape[2:]:
+                    target = F.interpolate(
+                        target, size=pred.shape[2:],
+                        mode="bilinear", align_corners=False,
+                    )
+                # Ensure channel dim matches
+                if pred.shape[1] != target.shape[1]:
+                    target = target[:, :pred.shape[1]]
+
+                loss = criterion(pred, target, deep_outputs)
 
                 # Scale loss by accumulation steps for correct gradient magnitude
                 loss = loss / accumulation_steps
@@ -339,18 +356,24 @@ def train_single_model(
         avg_train = epoch_loss / max(n_batches, 1)
         train_losses.append(avg_train)
 
-        # ── Test ──
+        # ── Test (2019-2020 temporal window, same spatial tiles) ──
         model.eval()
         test_loss = 0.0
         n_test = 0
         with torch.no_grad():
             for obs, target in test_loader:
-                obs = obs.to(device, non_blocking=True)
-                target = target.to(device, non_blocking=True)
+                obs = obs.to(device)
+                target = target.to(device)
                 pred = model(obs)
-                if pred.shape != target.shape:
-                    target = target[:, :1]
-                test_loss += criterion(pred, target).item()
+                if pred.shape[2:] != target.shape[2:]:
+                    target = F.interpolate(
+                        target, size=pred.shape[2:],
+                        mode="bilinear", align_corners=False,
+                    )
+                if pred.shape[1] != target.shape[1]:
+                    target = target[:, :pred.shape[1]]
+                # Test loss without deep supervision (main output only)
+                test_loss += base_criterion(pred, target).item()
                 n_test += 1
 
         avg_test = test_loss / max(n_test, 1)
@@ -358,27 +381,48 @@ def train_single_model(
 
         if avg_test < best_test_loss:
             best_test_loss = avg_test
+            epochs_without_improvement = 0
             weight_path = os.path.join(weights_dir, f"{name}_model.pt")
             torch.save(model.state_dict(), weight_path)
+        else:
+            epochs_without_improvement += 1
 
         epoch_time = time.time() - epoch_start
         if epoch % 5 == 0 or epoch == 1:
             print(f"  Epoch {epoch:3d}/{epochs}: train={avg_train:.6f}  "
                   f"test={avg_test:.6f}  best={best_test_loss:.6f}  "
-                  f"lr={current_lr:.2e}  time={epoch_time:.1f}s")
+                  f"lr={current_lr:.2e}  time={epoch_time:.1f}s"
+                  f"  patience={epochs_without_improvement}/{patience}")
 
-    # ── Final test metrics ──
+        # Early stopping
+        if epochs_without_improvement >= patience:
+            stopped_epoch = epoch
+            print(f"  ⚡ Early stopping at epoch {epoch} "
+                  f"(no improvement for {patience} epochs)")
+            break
+
+    # ── Final Validation (2021+, held-out spatial tiles) ──
+    print(f"\n  ── Final Validation (2021+, held-out tiles) ──")
+    model.load_state_dict(torch.load(
+        os.path.join(weights_dir, f"{name}_model.pt"),
+        map_location=device, weights_only=True,
+    ))
     model.eval()
     total_mse = 0.0
     total_dice = 0.0
     n_samples = 0
     with torch.no_grad():
-        for obs, target in test_loader:
-            obs = obs.to(device, non_blocking=True)
-            target = target.to(device, non_blocking=True)
+        for obs, target in val_loader:
+            obs = obs.to(device)
+            target = target.to(device)
             pred = model(obs)
-            if pred.shape != target.shape:
-                target = target[:, :1]
+            if pred.shape[2:] != target.shape[2:]:
+                target = F.interpolate(
+                    target, size=pred.shape[2:],
+                    mode="bilinear", align_corners=False,
+                )
+            if pred.shape[1] != target.shape[1]:
+                target = target[:, :pred.shape[1]]
 
             total_mse += F.mse_loss(pred, target).item()
             p, t = pred.flatten(), target.flatten()
@@ -387,22 +431,28 @@ def train_single_model(
             total_dice += dice.item()
             n_samples += 1
 
+    val_mse = round(total_mse / max(n_samples, 1), 6)
+    val_dice = round(total_dice / max(n_samples, 1), 4)
+
     metrics = {
         "model": name,
         "params": params,
-        "epochs": epochs,
+        "epochs": stopped_epoch,
+        "max_epochs": epochs,
+        "early_stopped": stopped_epoch < epochs,
         "effective_batch_size": effective_batch,
         "warmup_epochs": warmup_epochs,
         "amp_enabled": use_amp,
+        "temporal_split": {"train": "2001-2018", "test": "2019-2020", "validate": "2021-2023"},
         "final_train_loss": round(train_losses[-1], 6),
         "best_test_loss": round(best_test_loss, 6),
-        "test_mse": round(total_mse / max(n_samples, 1), 6),
-        "test_dice": round(total_dice / max(n_samples, 1), 4),
+        "val_mse": val_mse,
+        "val_dice": val_dice,
         "train_losses": [round(l, 6) for l in train_losses],
         "test_losses": [round(l, 6) for l in test_losses],
     }
 
-    print(f"\n  Final: MSE={metrics['test_mse']:.6f}  Dice={metrics['test_dice']:.4f}")
+    print(f"  Validation: MSE={val_mse:.6f}  Dice={val_dice:.4f}")
 
     return metrics
 
@@ -411,13 +461,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train MISDO models on real data")
     parser.add_argument("--model", default="all",
                         choices=["all", "fire", "forest", "hydro", "soil"])
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--tiles-dir", default="datasets/real_tiles")
     parser.add_argument("--weights-dir", default="weights")
     parser.add_argument("--accumulation-steps", type=int, default=4,
-                        help="Gradient accumulation steps (effective batch = 2 × this)")
+                        help="Gradient accumulation steps (effective batch = batch_size × this)")
     parser.add_argument("--amp", action="store_true",
                         help="Enable automatic mixed precision")
+    parser.add_argument("--early-stop-patience", type=int, default=10,
+                        help="Stop training if test loss hasn't improved for N epochs (default: 10)")
     args = parser.parse_args()
 
     os.makedirs(args.weights_dir, exist_ok=True)
@@ -450,7 +502,7 @@ def main() -> None:
         config = MODEL_CONFIGS[name]
         metrics = train_single_model(
             name, config, args.epochs, args.tiles_dir, args.weights_dir,
-            device, args.accumulation_steps, args.amp,
+            device, args.accumulation_steps, args.amp, args.early_stop_patience,
         )
         all_metrics[name] = metrics
 

@@ -74,34 +74,32 @@ def _compute_edge_fraction(forest: np.ndarray, r0: int, r1: int, c0: int, c1: in
     already harvested, or grid boundary). High edge fraction = good
     (harvesting at edges preserves interior habitat).
 
+    Uses vectorised NumPy operations (no Python for-loops over pixels).
+
     Returns a value in [0, 1].
     """
     block = forest[r0:r1, c0:c1]
-    if block.sum() < 1:
+    forest_pixels = block > 0.5
+    total_forest = forest_pixels.sum()
+    if total_forest < 1:
         return 0.0
 
-    # Pad the full forest grid's sub-region with 0 (boundary = non-forest)
-    # Check each forest pixel in the block for non-forest neighbours
+    # Pad entire grid with 0 (boundary = non-forest)
     padded = np.pad(forest, 1, mode="constant", constant_values=0)
-    # Adjust indices for padding
+    # Extract the padded region corresponding to our block
     pr0, pr1, pc0, pc1 = r0 + 1, r1 + 1, c0 + 1, c1 + 1
+    region = padded[pr0:pr1, pc0:pc1]
 
-    edge_count = 0
-    total_forest = 0
+    # Check 4-connected neighbours using shifted slices
+    has_non_forest_neighbour = (
+        (padded[pr0 - 1:pr1 - 1, pc0:pc1] < 0.5) |  # above
+        (padded[pr0 + 1:pr1 + 1, pc0:pc1] < 0.5) |  # below
+        (padded[pr0:pr1, pc0 - 1:pc1 - 1] < 0.5) |  # left
+        (padded[pr0:pr1, pc0 + 1:pc1 + 1] < 0.5)     # right
+    )
 
-    for r in range(pr0, pr1):
-        for c in range(pc0, pc1):
-            if padded[r, c] > 0.5:
-                total_forest += 1
-                # Check 4-connected neighbours
-                neighbours = [
-                    padded[r - 1, c], padded[r + 1, c],
-                    padded[r, c - 1], padded[r, c + 1],
-                ]
-                if any(n < 0.5 for n in neighbours):
-                    edge_count += 1
-
-    return edge_count / max(total_forest, 1)
+    edge_count = (forest_pixels & has_non_forest_neighbour).sum()
+    return float(edge_count) / float(total_forest)
 
 
 class DeforestationEnv(gym.Env):

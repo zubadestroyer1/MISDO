@@ -12,7 +12,7 @@ Channels (5):
     1: slope (degrees, normalised)
     2: aspect (sin-encoded)
     3: flow_accumulation (log-normalised)
-    4: flow_direction (normalised)
+    4: forest_cover (canopy %, deforestation-aware)
 """
 
 from __future__ import annotations

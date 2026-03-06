@@ -4,13 +4,15 @@ MISDO — Train All Domain-Specific Models
 Training pipeline for 4 dataset-specific risk models using
 physically-realistic synthetic data.
 
-Fixes applied (vs. original):
-    ✓ Data augmentation (random flips, rotations)
+Features:
+    ✓ Consolidated production-grade loss functions (NaN-safe)
+    ✓ UNet++ deep supervision auxiliary losses
+    ✓ Data augmentation (random flips, rotations, brightness)
     ✓ Proper train/validation split (80/20 by seed)
     ✓ Best checkpoint saving (val loss, not last epoch)
-    ✓ FocalBCELoss prediction clamping (prevents NaN)
     ✓ Early stopping (patience=10 epochs)
-    ✓ Learning rate warmup
+    ✓ Learning rate warmup + cosine annealing
+    ✓ MPS-safe DataLoader and device detection
 
 Usage:
     python train_models.py --model all --epochs 30
@@ -22,6 +24,7 @@ Models are saved to weights/ directory.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -32,7 +35,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset, Subset
 
 # Local imports
@@ -41,6 +43,13 @@ from datasets.viirs_fire import VIIRSFireDataset
 from datasets.hansen_gfc import HansenGFCDataset
 from datasets.srtm_hydro import SRTMHydroDataset
 from datasets.smap_soil import SMAPSoilDataset
+from losses import (
+    FocalBCELoss,
+    DiceBCELoss,
+    GradientMSELoss,
+    SmoothMSELoss,
+    DeepSupervisionWrapper,
+)
 from models.fire_model import FireRiskNet
 from models.forest_model import ForestLossNet
 from models.hydro_model import HydroRiskNet
@@ -104,100 +113,58 @@ class AugmentedDataset(Dataset):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Loss functions
+# Device utilities
 # ═══════════════════════════════════════════════════════════════════════════
 
-class FocalBCELoss(nn.Module):
-    """Binary cross-entropy with focal weighting for class imbalance.
-
-    Used for fire detection where positive pixels are sparse.
-    Predictions are clamped to [ε, 1-ε] to prevent log(0) → NaN.
-    """
-
-    def __init__(self, alpha: float = 0.75, gamma: float = 2.0) -> None:
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-
-    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        pred = pred.clamp(1e-7, 1.0 - 1e-7)  # Prevent NaN
-        bce = F.binary_cross_entropy(pred, target, reduction="none")
-        p_t = pred * target + (1 - pred) * (1 - target)
-        focal_weight = self.alpha * (1 - p_t) ** self.gamma
-        return (focal_weight * bce).mean()
+def _get_device() -> torch.device:
+    """Select the best available device: MPS > CUDA > CPU."""
+    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        return torch.device("mps")
+    elif torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
 
 
-class DiceBCELoss(nn.Module):
-    """Combined Dice + BCE loss for segmentation with fragmented patches."""
-
-    def __init__(self, dice_weight: float = 0.5) -> None:
-        super().__init__()
-        self.dice_weight = dice_weight
-
-    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        pred = pred.clamp(1e-7, 1.0 - 1e-7)
-        bce = F.binary_cross_entropy(pred, target)
-
-        smooth = 1.0
-        pred_flat = pred.flatten()
-        target_flat = target.flatten()
-        intersection = (pred_flat * target_flat).sum()
-        dice = 1 - (2 * intersection + smooth) / (
-            pred_flat.sum() + target_flat.sum() + smooth
-        )
-
-        return bce * (1 - self.dice_weight) + dice * self.dice_weight
+def _get_dataloader_kwargs(device: torch.device) -> dict:
+    """MPS/CUDA-safe DataLoader settings."""
+    if device.type == "cuda":
+        return {"num_workers": min(4, os.cpu_count() or 1), "pin_memory": True}
+    return {"num_workers": 0, "pin_memory": False}
 
 
-class GradientMSELoss(nn.Module):
-    """MSE + gradient-matching regulariser for smooth risk surfaces."""
+# ═══════════════════════════════════════════════════════════════════════════
+# LR Scheduler with Warmup
+# ═══════════════════════════════════════════════════════════════════════════
 
-    def __init__(self, grad_weight: float = 0.3) -> None:
-        super().__init__()
-        self.grad_weight = grad_weight
+class WarmupCosineScheduler:
+    """Linear warmup for first N epochs, then cosine annealing to zero."""
 
-    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        mse = F.mse_loss(pred, target)
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        warmup_epochs: int,
+        total_epochs: int,
+    ) -> None:
+        self.optimizer = optimizer
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.base_lrs = [pg["lr"] for pg in optimizer.param_groups]
 
-        pred_dx = pred[:, :, :, 1:] - pred[:, :, :, :-1]
-        pred_dy = pred[:, :, 1:, :] - pred[:, :, :-1, :]
-        tgt_dx = target[:, :, :, 1:] - target[:, :, :, :-1]
-        tgt_dy = target[:, :, 1:, :] - target[:, :, :-1, :]
+    def step(self, epoch: int) -> None:
+        """Update learning rate (1-indexed epoch)."""
+        if epoch <= self.warmup_epochs:
+            scale = epoch / max(self.warmup_epochs, 1)
+        else:
+            progress = (epoch - self.warmup_epochs) / max(
+                self.total_epochs - self.warmup_epochs, 1
+            )
+            scale = 0.5 * (1.0 + math.cos(math.pi * progress))
 
-        grad_loss = F.mse_loss(pred_dx, tgt_dx) + F.mse_loss(pred_dy, tgt_dy)
+        for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+            pg["lr"] = base_lr * scale
 
-        return mse + self.grad_weight * grad_loss
-
-
-class SmoothMSELoss(nn.Module):
-    """MSE + spatial smoothness + correlation reward.
-
-    Low smooth_weight prevents total-variation from dominating and
-    causing mode collapse to zero.
-    """
-
-    def __init__(self, smooth_weight: float = 0.05, corr_weight: float = 0.2) -> None:
-        super().__init__()
-        self.smooth_weight = smooth_weight
-        self.corr_weight = corr_weight
-
-    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        mse = F.mse_loss(pred, target)
-
-        tv_h = (pred[:, :, 1:, :] - pred[:, :, :-1, :]).abs().mean()
-        tv_w = (pred[:, :, :, 1:] - pred[:, :, :, :-1]).abs().mean()
-        smoothness = tv_h + tv_w
-
-        p = pred.flatten()
-        t = target.flatten()
-        p_centered = p - p.mean()
-        t_centered = t - t.mean()
-        corr = (p_centered * t_centered).sum() / (
-            p_centered.norm() * t_centered.norm() + 1e-8
-        )
-        corr_loss = 1 - corr
-
-        return mse + self.smooth_weight * smoothness + self.corr_weight * corr_loss
+    def get_last_lr(self) -> list:
+        return [pg["lr"] for pg in self.optimizer.param_groups]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -270,11 +237,12 @@ def train_single_model(
         cfg["dataset_class"](
             num_samples=val_samples, spatial_size=256, seed=10000
         ),
-        augment=False,  # No augmentation for validation
+        augment=False,
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    dl_kwargs = _get_dataloader_kwargs(device)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, **dl_kwargs)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, **dl_kwargs)
 
     print(f"  Train samples: {train_samples}  Val samples: {val_samples}")
 
@@ -283,10 +251,14 @@ def train_single_model(
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  Parameters: {total_params:,}")
 
-    # Loss, optimizer, scheduler
-    criterion = cfg["loss_class"]()
+    # Loss with deep supervision wrapper, optimizer, scheduler
+    base_criterion = cfg["loss_class"]()
+    criterion = DeepSupervisionWrapper(base_criterion, aux_weight=0.3)
     optimizer = AdamW(model.parameters(), lr=cfg["lr"], weight_decay=1e-4)
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+
+    warmup_epochs = max(1, epochs // 10)
+    scheduler = WarmupCosineScheduler(optimizer, warmup_epochs, epochs)
+    print(f"  LR warmup: {warmup_epochs} epochs")
 
     # Training state
     best_val_loss = float("inf")
@@ -298,6 +270,8 @@ def train_single_model(
     weight_path = os.path.join(save_dir, f"{name}_model.pt")
 
     for epoch in range(epochs):
+        scheduler.step(epoch + 1)
+
         # ── Train ──
         model.train()
         epoch_loss = 0.0
@@ -307,8 +281,17 @@ def train_single_model(
             obs = obs.to(device)
             target = target.to(device)
 
-            pred = model(obs)
-            loss = criterion(pred, target)
+            # Forward with deep supervision
+            bottleneck, skips = model.encode(obs)
+            features = {"s1": skips["s1"], "s2": skips["s2"], "s3": skips["s3"], "s4": bottleneck}
+            pred_result = model.decoder(features, return_deep=True)
+
+            if isinstance(pred_result, tuple):
+                pred, deep_outputs = pred_result
+            else:
+                pred, deep_outputs = pred_result, None
+
+            loss = criterion(pred, target, deep_outputs)
 
             optimizer.zero_grad()
             loss.backward()
@@ -318,7 +301,6 @@ def train_single_model(
             epoch_loss += loss.item()
             n_batches += 1
 
-        scheduler.step()
         avg_train_loss = epoch_loss / max(n_batches, 1)
         history["train"].append(avg_train_loss)
 
@@ -333,7 +315,7 @@ def train_single_model(
                 obs = obs.to(device)
                 target = target.to(device)
                 pred = model(obs)
-                val_loss += criterion(pred, target).item()
+                val_loss += base_criterion(pred, target).item()
                 pred_stats["min"] = min(pred_stats["min"], pred.min().item())
                 pred_stats["max"] = max(pred_stats["max"], pred.max().item())
                 pred_stats["mean"] += pred.mean().item()
@@ -399,13 +381,7 @@ def main() -> None:
                         help="Early stopping patience (default: 10)")
     args = parser.parse_args()
 
-    # Device selection: MPS (Apple Silicon) > CUDA > CPU
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
+    device = _get_device()
     print(f"Device: {device}")
 
     models_to_train = (

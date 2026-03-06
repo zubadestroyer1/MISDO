@@ -51,6 +51,8 @@ Dense nested skip connections aggregate features across all encoder scales:
 
 - **Data augmentation**: random flips, rotations, brightness jitter
 - **Optimizer**: AdamW (lr=5e-4, weight_decay=1e-4)
-- **Scheduler**: cosine annealing
+- **Scheduler**: warmup cosine annealing
+- **UNet++ deep supervision** auxiliary losses (aux_weight=0.3)
 - **Best checkpoint saving** on validation loss
 - **Early stopping** (patience=10)
+- **NaN-safe losses** with prediction clamping for AMP
