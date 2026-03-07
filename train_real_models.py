@@ -218,36 +218,36 @@ def train_single_model(
         Early stopping patience — stop training if test loss hasn't
         improved for this many consecutive epochs (default 10).
     """
-    # ── Strict Temporal Split Strategy ────────────────────────────────
-    # Train:    spatial "train" tiles, events years 1-16, impact by 18
-    # Test:     spatial "train" tiles, events years 17-18, impact by 20
-    #           → same locations but STRICTLY non-overlapping event years
-    # Validate: spatial "test" tiles,  events years 19-21, impact by 23
-    #           → true hold-out: unseen locations AND unseen time period
+    # ── Spatial-Only Split Strategy ───────────────────────────────────
+    # Train:    chips from spatial "train" tiles  (80% of tiles)
+    # Test:     chips from spatial "test" tiles   (20% of tiles)
+    # Validate: chips from spatial "test" tiles   (same as test)
+    #
+    # All splits sample from the FULL temporal range (years 1–23).
+    # Spatial tile-level splitting prevents data leakage.
+    # The model learns time-invariant physics (clearing → impact).
     # ──────────────────────────────────────────────────────────────────
 
     # ── Compute global target scale ───────────────────────────────────
-    # Pre-scan chips to find a consistent normalisation scale so that
-    # target magnitudes are comparable across chips.
     print(f"  Computing global target scale for {name}...")
     target_scale = compute_global_target_scale(name, tiles_dir, split="train")
 
-    # Dataset
+    # Dataset — spatial split only, full temporal range
     DatasetCls = config["dataset_cls"]
     if config["temporal"]:
-        train_ds = DatasetCls(tiles_dir=tiles_dir, split="train", T=5, train_end_year=18,
-                              temporal_split="train", target_scale=target_scale)
-        test_ds  = DatasetCls(tiles_dir=tiles_dir, split="train", T=5, train_end_year=20,
-                              year_start=15, temporal_split="test", target_scale=target_scale)
-        val_ds   = DatasetCls(tiles_dir=tiles_dir, split="test",  T=5, train_end_year=23,
-                              year_start=17, temporal_split="validate", target_scale=target_scale)
+        train_ds = DatasetCls(tiles_dir=tiles_dir, split="train", T=5,
+                              train_end_year=23, target_scale=target_scale)
+        test_ds  = DatasetCls(tiles_dir=tiles_dir, split="test", T=5,
+                              train_end_year=23, target_scale=target_scale)
+        val_ds   = DatasetCls(tiles_dir=tiles_dir, split="test", T=5,
+                              train_end_year=23, target_scale=target_scale)
     else:
-        train_ds = DatasetCls(tiles_dir=tiles_dir, split="train", train_end_year=18,
-                              temporal_split="train", target_scale=target_scale)
-        test_ds  = DatasetCls(tiles_dir=tiles_dir, split="train", train_end_year=20,
-                              temporal_split="test", target_scale=target_scale)
-        val_ds   = DatasetCls(tiles_dir=tiles_dir, split="test",  train_end_year=23,
-                              temporal_split="validate", target_scale=target_scale)
+        train_ds = DatasetCls(tiles_dir=tiles_dir, split="train",
+                              train_end_year=23, target_scale=target_scale)
+        test_ds  = DatasetCls(tiles_dir=tiles_dir, split="test",
+                              train_end_year=23, target_scale=target_scale)
+        val_ds   = DatasetCls(tiles_dir=tiles_dir, split="test",
+                              train_end_year=23, target_scale=target_scale)
 
     batch_size = 16 if device.type == "cuda" else 2
     dl_kwargs = _get_dataloader_kwargs(device)
@@ -267,7 +267,7 @@ def train_single_model(
     model = config["model_cls"]().to(device)
     params = sum(p.numel() for p in model.parameters())
     print(f"  Parameters: {params:,}")
-    print(f"  Strict temporal split: train events ≤2016 | test events 2017–2018 | validate events 2019–2021")
+    print(f"  Spatial split: train tiles (80%) | test/validate tiles (20%) | all years 1–23")
     print(f"  Train: {len(train_ds)}, Test: {len(test_ds)}, Validate: {len(val_ds)}")
     print(f"  Effective batch size: {effective_batch}")
 

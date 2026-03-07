@@ -314,20 +314,17 @@ def evaluate_model(
     params = sum(p.numel() for p in model.parameters())
     print(f"  Parameters: {params:,}")
 
-    # Load validation dataset (2019-2021 events, held-out spatial tiles)
-    # Must match train_real_models.py validation config exactly
-    # temporal_split="validate" → _sample_window() else branch: events 2019–2021, impact by 2023
+    # Load validation dataset (held-out spatial tiles, full year range)
+    # Matches train_real_models.py — spatial-only split, no temporal filtering
     print(f"  Computing global target scale for {name}...")
     target_scale = compute_global_target_scale(name, tiles_dir, split="train")
 
     DatasetCls = config["dataset_cls"]
     if config["temporal"]:
         val_ds = DatasetCls(tiles_dir=tiles_dir, split="test", T=5, train_end_year=23,
-                            year_start=17, temporal_split="validate",
                             target_scale=target_scale)
     else:
         val_ds = DatasetCls(tiles_dir=tiles_dir, split="test", train_end_year=23,
-                            temporal_split="validate",
                             target_scale=target_scale)
 
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False)

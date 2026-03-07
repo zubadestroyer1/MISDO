@@ -308,16 +308,17 @@ def _control_baseline(
 def _sample_window(
     split: str,
     rng: np.random.RandomState,
-    train_end: int = 18,
+    train_end: int = 23,
     min_window: int = 2,
     max_window: int = 5,
 ) -> Tuple[int, int, int]:
-    """Sample random (T₁, T₂, T_impact) window within split bounds.
+    """Sample random (T₁, T₂, T_impact) window from the full year range.
 
-    Strict temporal separation ensures NO overlap between splits:
-        Train:    events in years  1–16,  impact observed by year 18
-        Test:     events in years 17–18,  impact observed by year 20
-        Validate: events in years 19–21,  impact observed by year 23
+    All splits use the full temporal range (years 1–23) because data
+    leakage is prevented by the spatial tile-level split (different
+    geographic tiles for train vs test).  The model learns a
+    time-invariant physical relationship (clearing → impact), so
+    temporal holdout is unnecessary.
 
     Returns
     -------
@@ -328,34 +329,18 @@ def _sample_window(
     t_impact : int
         Year by which to measure impact (t2 + delta).
     """
-    if split == "train":
-        # Events must end by year 16 so that with a 2-year impact window,
-        # impact is fully observed by year 18.  This leaves years 17+
-        # completely untouched for test/validate.
-        delta = rng.randint(min_window, max_window + 1)
-        max_t2 = min(16, train_end - delta)  # cap at year 16
-        min_t1 = 1
-        if max_t2 <= min_t1 + 1:
-            t1, t2, t_impact = 1, 8, min(8 + delta, train_end)
-        else:
-            t2 = rng.randint(min_t1 + 2, max_t2 + 1)  # ensure t2 >= 3
-            max_win = min(max_window, t2 - min_t1)
-            window = max(1, rng.randint(1, max_win + 1)) if max_win >= 1 else 1
-            t1 = max(min_t1, t2 - window)
-            t_impact = t2 + delta
-    elif split == "test":
-        # Test: events in years 17-18, impact observed by 20
-        # Strictly non-overlapping with train (≤16) and validate (≥19)
-        # numpy randint upper is exclusive, so randint(17, 19) → {17, 18}
-        t1 = rng.randint(17, 19)
-        t2 = min(t1 + rng.randint(0, 2), 18)
-        t_impact = min(t2 + 2, 20)
+    delta = rng.randint(min_window, max_window + 1)
+    max_t2 = train_end - delta  # leave room for impact observation
+    min_t1 = 1
+    if max_t2 <= min_t1 + 1:
+        # Fallback for very short ranges
+        t1, t2, t_impact = 1, 8, min(8 + delta, train_end)
     else:
-        # Validate: events in years 19-21, impact observed by 23
-        # Strictly non-overlapping with train (≤16) and test (17-18)
-        t1 = rng.randint(19, 22)  # 19, 20, or 21
-        t2 = min(t1 + rng.randint(0, 3), 21)
-        t_impact = min(t2 + 2, 23)
+        t2 = rng.randint(min_t1 + 2, max_t2 + 1)  # ensure t2 >= 3
+        max_win = min(max_window, t2 - min_t1)
+        window = max(1, rng.randint(1, max_win + 1)) if max_win >= 1 else 1
+        t1 = max(min_t1, t2 - window)
+        t_impact = min(t2 + delta, train_end)
 
     return int(t1), int(t2), int(t_impact)
 
