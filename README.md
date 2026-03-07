@@ -1,8 +1,18 @@
 # MISDO — Multi-domain Intelligent Sustainable Deforestation Optimizer
 
-> AI-driven environmental risk analysis and decision-support system for sustainable forestry planning.
+> AI-driven environmental **impact analysis** and decision-support system for sustainable forestry planning.
 
-MISDO fuses satellite data from 4 remote sensing domains (VIIRS fire, Hansen forest change, SRTM hydrology, SMAP soil moisture) through domain-specific neural networks, aggregates their outputs into a unified harm mask, and uses reinforcement learning to find optimal harvest sequences that minimise environmental damage.
+MISDO uses a **temporal counterfactual approach** to predict what happens to surrounding forest when an area is cleared. It fuses satellite data from 4 remote sensing domains through domain-specific neural networks, aggregates their outputs into a unified harm mask, and uses reinforcement learning to find optimal harvest sequences that minimise environmental damage.
+
+---
+
+## How It Works
+
+Instead of predicting static "risk maps," each model answers:
+
+> *"If I clear THIS area, how much does fire / cascade deforestation / erosion / soil degradation **increase** in the surrounding forest?"*
+
+This is learned from **real before-and-after satellite data** (Hansen GFC deforestation history + VIIRS fire detections), using temporal counterfactual targets with control-pixel baseline subtraction to isolate causal impact from background trends.
 
 ---
 
@@ -19,10 +29,10 @@ MISDO fuses satellite data from 4 remote sensing domains (VIIRS fire, Hansen for
 │       │              │              │              │                    │
 │       ▼              ▼              ▼              ▼                    │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐               │
-│  │ FireRisk │  │ Forest   │  │ HydroRisk│  │ SoilRisk │  ConvNeXt-V2  │
-│  │ Net      │  │ LossNet  │  │ Net      │  │ Net      │  + UNet++     │
-│  │ ~34M     │  │ ~34M     │  │ ~34M     │  │ ~34M     │               │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘               │
+│  │ FireImpac│  │ Forest   │  │ HydroImp │  │ SoilImpa │  ConvNeXt-V2  │
+│  │ tNet     │  │ ImpactNet│  │ actNet   │  │ ctNet    │  + UNet++     │
+│  │ ~40M     │  │ ~40M     │  │ ~40M     │  │ ~40M     │  + Dilated    │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘    Context    │
 │       │              │              │              │                    │
 │       └──────┬───────┴──────┬───────┘              │                    │
 │              │              │                      │                    │
@@ -46,22 +56,30 @@ MISDO fuses satellite data from 4 remote sensing domains (VIIRS fire, Hansen for
 
 ## Models
 
-All models use a **ConvNeXt-V2 Base** encoder with **UNet++** decoder (nested dense skip connections).
+All models use a **ConvNeXt-V2 Base** encoder + **UNet++ decoder** + **DilatedContextModule** (ASPP) at bottleneck for long-range impact. Output uses ReLU + clamp(0,1) instead of sigmoid.
 
-| Model | Architecture | Params | Input | Data Source | Loss |
-|---|---|---|---|---|---|
-| [FireRiskNet](docs/FireRiskNet.md) | ConvNeXt-V2 + UNet++ | ~34M | 6ch (VIIRS I-bands + FRP) | VIIRS VNP14IMG | Focal BCE |
-| [ForestLossNet](docs/ForestLossNet.md) | ConvNeXt-V2 + UNet++ | ~34M | 5ch (treecover, lossyear, gain, red, NIR) | Hansen GFC | Dice + BCE |
-| [HydroRiskNet](docs/HydroRiskNet.md) | ConvNeXt-V2 + UNet++ | ~34M | 5ch (elevation, slope, aspect, flow_acc, flow_dir) | SRTM/HydroSHEDS | Gradient MSE |
-| [SoilRiskNet](docs/SoilRiskNet.md) | ConvNeXt-V2 + UNet++ | ~34M | 4ch (moisture, veg_water, temp, freeze_thaw) | SMAP L3 | Smooth MSE |
+| Model | Params | Input | Target | Loss |
+|---|---|---|---|---|
+| [FireRiskNet](docs/FireRiskNet.md) | ~40M | 7ch (VIIRS + defo mask) | Fire increase near clearing | Edge-Weighted MSE |
+| [ForestLossNet](docs/ForestLossNet.md) | ~40M | 6ch (Hansen + defo mask) | Cascade deforestation | Edge-Weighted MSE |
+| [HydroRiskNet](docs/HydroRiskNet.md) | ~40M | 6ch (SRTM + defo mask) | Erosion increase downstream | Edge-Weighted MSE |
+| [SoilRiskNet](docs/SoilRiskNet.md) | ~40M | 5ch (soil + defo mask) | Soil degradation increase | Edge-Weighted MSE |
 
 ### Key Architecture Features
 
 - **ConvNeXt-V2 encoder** with Global Response Normalization (GRN) and stochastic depth
 - **UNet++ decoder** with nested dense skip connections and deep supervision
+- **DilatedContextModule** (ASPP-style) at bottleneck — multi-rate dilated convolutions for 1–5 km impact propagation
 - **Multi-head temporal attention** for fusing multi-timestep inputs
-- **Cross-domain feature fusion** exchanging information between domain bottlenecks
-- **Hybrid aggregator** — deterministic weighted sum + learnable cross-domain correction
+- **Deforestation mask input channel** — model knows WHERE clearing happened
+- **ReLU + clamp output** for sharper gradients on near-zero impact deltas
+
+### Key Training Features
+
+- **Sliding temporal windows** — ~100 samples per chip (vs 1 with fixed windows)
+- **Control-pixel baseline subtraction** — isolates causal signal from background trends
+- **Single-patch augmentation** — 50% chance to show one clearing, bridging train/inference gap
+- **EdgeWeightedMSELoss** — 3× weight near deforestation edges where signal is strongest
 
 See the [docs/](docs/) directory for detailed architecture documentation.
 
@@ -78,10 +96,9 @@ See the [docs/](docs/) directory for detailed architecture documentation.
 
 ### Uncertainty Quantification
 
-MC Dropout inference provides per-pixel confidence intervals on all risk predictions:
+MC Dropout inference provides per-pixel confidence intervals on all impact predictions:
 - Mean prediction, standard deviation, 90% credible intervals, and predictive entropy
 - Encoder features computed once, decoder sampled N times (~20× faster than naive MC)
-- Essential for decision-makers who need to know prediction reliability
 
 ```python
 from uncertainty import enable_mc_dropout, predict_with_uncertainty
@@ -92,14 +109,11 @@ result = predict_with_uncertainty(model, x, n_samples=20)
 
 ### Explainability (GradCAM)
 
-Visual attribution maps showing *why* each pixel is predicted as high or low risk:
-- GradCAM on encoder bottleneck for region-level spatial explanations
-- Per-channel importance breakdown (e.g., "73% attributed to deforestation edges")
-- Audit-ready: provides evidence trail for regulatory compliance
+Visual attribution maps showing *why* each pixel has high or low predicted impact:
 
 ```python
 from explainability import generate_attribution_report
-report = generate_attribution_report(model, obs, channel_names=["I1", "I2", "I3", "I4", "I5", "FRP"])
+report = generate_attribution_report(model, obs, channel_names=["I1", "I2", "I3", "I4", "I5", "FRP", "defo_mask"])
 # report['attribution_map'], report['channel_importance']
 ```
 
@@ -107,8 +121,7 @@ report = generate_attribution_report(model, obs, channel_names=["I1", "I2", "I3"
 
 Prevents data leakage through spatial autocorrelation and temporal correlation:
 - **Spatial blocking**: 1° blocks (~111 km) ensuring adjacent tiles never split across folds
-- **Temporal holdout**: train ≤2018, validation 2019-2020, test 2021-2023
-- Follows best practices from Ploton et al. (2020, Nature Communications)
+- **Temporal holdout**: train events ≤2016 (impact ≤2018), test 2017–2018, validate 2019+
 
 ```python
 from validation import SpatialBlockCV, TemporalHoldout
@@ -147,18 +160,6 @@ python evaluate_models.py --tiles-dir datasets/real_tiles --weights-dir weights
 
 > **📖 For full A100 cluster setup, global-scale data download, and production training instructions, see the [Training Runbook](docs/TrainingRunbook.md).**
 
-### Training Features
-
-- **Consolidated NaN-safe loss functions** with prediction clamping for AMP
-- **UNet++ deep supervision** auxiliary losses for improved convergence
-- **LR warmup + cosine annealing** schedule
-- **Gradient accumulation** for larger effective batch sizes (up to 64 on A100)
-- **Automatic Mixed Precision (AMP)** for 2× throughput on CUDA
-- **MPS/CUDA/CPU** automatic device detection with safe DataLoader settings
-- **Data augmentation**: random flips, rotations, brightness jitter
-- **Best checkpoint saving** on test loss with early stopping
-- **Temporal split**: train ≤2018, test 2019–2020, validate 2021–2023
-
 ### Start the Web Server
 
 ```bash
@@ -172,43 +173,37 @@ python server.py
 ```
 .
 ├── models/
-│   ├── __init__.py           # Model registry
-│   ├── base_model.py         # Shared base model architecture
-│   ├── backbone.py           # ConvNeXt-V2 encoder (shared)
-│   ├── decoders.py           # UNet++ decoder (shared)
-│   ├── fire_model.py         # FireRiskNet
-│   ├── forest_model.py       # ForestLossNet
-│   ├── hydro_model.py        # HydroRiskNet
-│   ├── soil_model.py         # SoilRiskNet
+│   ├── base_model.py         # Shared ConvNeXt-V2 + UNet++ base
+│   ├── backbone.py           # ConvNeXt-V2 encoder
+│   ├── decoders.py           # UNet++ decoder + DilatedContextModule
+│   ├── fire_model.py         # FireRiskNet (7ch → impact)
+│   ├── forest_model.py       # ForestLossNet (6ch → cascade)
+│   ├── hydro_model.py        # HydroRiskNet (6ch → erosion)
+│   ├── soil_model.py         # SoilRiskNet (5ch → degradation)
 │   ├── temporal.py           # Multi-head temporal attention
 │   └── fusion.py             # Cross-domain feature fusion
 ├── datasets/
-│   ├── __init__.py           # Dataset registry
-│   ├── real_datasets.py      # Real Hansen GFC multi-temporal datasets
-│   ├── download_real_data.py # Script for downloading real satellite tiles
-│   ├── viirs_fire.py         # VIIRS synthetic data
-│   ├── hansen_gfc.py         # Hansen GFC synthetic data
-│   ├── srtm_hydro.py         # SRTM/HydroSHEDS synthetic data
-│   └── smap_soil.py          # SMAP soil synthetic data
+│   ├── real_datasets.py      # Real counterfactual datasets (sliding windows)
+│   ├── download_real_data.py # Satellite tile downloader (curated + global)
+│   ├── viirs_fire.py         # Synthetic fire impact data
+│   ├── hansen_gfc.py         # Synthetic cascade deforestation data
+│   ├── srtm_hydro.py         # Synthetic erosion impact data
+│   └── smap_soil.py          # Synthetic soil degradation data
 ├── weights/                  # Trained model checkpoints
 ├── docs/                     # Architecture documentation
-│   ├── TrainingRunbook.md    # A100 training guide (setup → deploy)
-│   └── ...                   # Model & component docs
+│   └── TrainingRunbook.md    # A100 training guide
 ├── static/                   # Web UI assets
-├── losses.py                 # Consolidated production-grade loss functions
+├── losses.py                 # Loss functions (EdgeWeightedMSE, SmoothMSE, etc.)
 ├── uncertainty.py            # MC Dropout uncertainty quantification
 ├── explainability.py         # GradCAM attribution maps
 ├── validation.py             # Spatial cross-validation & temporal holdout
-├── aggregator.py             # Hybrid risk fusion module
-├── perception.py             # Domain model orchestration
+├── aggregator.py             # Hybrid impact fusion module
 ├── env.py                    # Gymnasium RL environment
 ├── impact.py                 # Cascading impact propagation (D8 routing)
 ├── evaluate_models.py        # Post-training model evaluation
-├── train.py                  # End-to-end PPO training
-├── train_models.py           # Domain model training (synthetic data)
-├── train_real_models.py      # Domain model training (real satellite data)
+├── train_models.py           # Domain model training (synthetic)
+├── train_real_models.py      # Domain model training (real satellite)
 ├── server.py                 # Flask web server
-├── test_real_pipeline.py     # Pipeline integration tests
 └── requirements.txt          # Python dependencies
 ```
 

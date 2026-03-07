@@ -253,15 +253,27 @@ class RealMISDOPerception(nn.Module):
             print(f"  [RealPerception] CrossDomainFusion enabled "
                   f"({sum(p.numel() for p in self.fusion.parameters()):,} params)")
 
-    def forward(self, domain_inputs: dict) -> Tensor:
-        """Run each sub-model's encoder, fuse bottlenecks, then decode.
+    def forward(
+        self,
+        domain_inputs: dict,
+        domain_inputs_counterfactual: dict | None = None,
+    ) -> Tensor:
+        """Run domain models, optionally with Siamese paired forward.
 
         Parameters
         ----------
         domain_inputs : dict
+            Factual domain tensors (or single-pass inputs for backward compat).
             Keys: "fire", "forest", "hydro", "soil"
-            Values: Tensor [B, C_i, 256, 256] where C_i varies per domain.
+        domain_inputs_counterfactual : dict, optional
+            Counterfactual domain tensors (with deforestation mask active).
+            If provided, uses paired forward (delta = cf - factual).
+            If None, falls back to single-pass forward (backward compat).
         """
+        if domain_inputs_counterfactual is not None:
+            return self._forward_paired(domain_inputs, domain_inputs_counterfactual)
+
+        # ── Single-pass forward (backward compat) ──
         # Phase 1: Encode all domains
         bottlenecks: dict = {}
         all_skips: dict = {}
@@ -284,6 +296,50 @@ class RealMISDOPerception(nn.Module):
             masks.append(mask)
 
         return torch.cat(masks, dim=1)  # [B, 4, 256, 256]
+
+    def _forward_paired(
+        self,
+        domain_factual: dict,
+        domain_counterfactual: dict,
+    ) -> Tensor:
+        """Siamese paired forward for counterfactual impact prediction.
+
+        Runs each sub-model twice (shared weights) and returns the
+        clamped delta (counterfactual - factual) per domain.
+        """
+        # Phase 1: Encode factual
+        bottlenecks_f: dict = {}
+        all_skips_f: dict = {}
+        for name in self.HEAD_NAMES:
+            model = self.sub_models[name]
+            b, skips = model.encode(domain_factual[name])
+            bottlenecks_f[name] = b
+            all_skips_f[name] = skips
+
+        # Phase 2: Encode counterfactual
+        bottlenecks_cf: dict = {}
+        all_skips_cf: dict = {}
+        for name in self.HEAD_NAMES:
+            model = self.sub_models[name]
+            b, skips = model.encode(domain_counterfactual[name])
+            bottlenecks_cf[name] = b
+            all_skips_cf[name] = skips
+
+        # Phase 3: Cross-domain fusion (if enabled, applied separately)
+        if self.use_fusion:
+            bottlenecks_f = self.fusion(bottlenecks_f)
+            bottlenecks_cf = self.fusion(bottlenecks_cf)
+
+        # Phase 4: Decode both and compute delta
+        deltas: list[Tensor] = []
+        for name in self.HEAD_NAMES:
+            model = self.sub_models[name]
+            out_f = model.decode(bottlenecks_f[name], all_skips_f[name])
+            out_cf = model.decode(bottlenecks_cf[name], all_skips_cf[name])
+            delta = torch.clamp(out_cf - out_f, 0.0, 1.0)
+            deltas.append(delta)
+
+        return torch.cat(deltas, dim=1)  # [B, 4, 256, 256]
 
 
 # ---------------------------------------------------------------------------

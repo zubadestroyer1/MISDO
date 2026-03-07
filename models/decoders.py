@@ -5,6 +5,12 @@ Dense decoder with nested skip pathways for high-accuracy dense
 prediction.  Compatible with the ConvNeXt V2 backbone's multi-scale
 feature maps.
 
+Includes a DilatedContextModule (ASPP-style) at the bottleneck to
+capture long-range spatial impact propagation (1–5 km at 30 m res).
+
+Output uses ReLU + clamp(0, 1) instead of sigmoid for sharper
+gradients on near-zero impact deltas.
+
 Reference:
     Zhou et al., "UNet++: A Nested U-Net Architecture for Medical
     Image Segmentation", DLMIA 2018.
@@ -90,6 +96,78 @@ class UpBlock(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Dilated Context Module (ASPP-style)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class DilatedContextModule(nn.Module):
+    """Multi-rate dilated convolutions for long-range spatial context.
+
+    Captures impact propagation at multiple spatial scales (1–5 km at
+    30 m resolution).  Applied at the bottleneck (H/32) where each
+    pixel represents ~1 km.
+
+    Inspired by ASPP (Atrous Spatial Pyramid Pooling) from DeepLab.
+
+    Parameters
+    ----------
+    channels : int
+        Number of input/output channels.
+    rates : list of int
+        Dilation rates for each parallel branch (default [1, 3, 6, 12]).
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        rates: list[int] | None = None,
+    ) -> None:
+        super().__init__()
+        if rates is None:
+            rates = [1, 3, 6, 12]
+
+        mid = channels // 4
+
+        self.branches = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(
+                    channels, mid, kernel_size=3,
+                    padding=r, dilation=r, bias=False,
+                ),
+                nn.GroupNorm(min(16, mid), mid),
+                nn.GELU(),
+            )
+            for r in rates
+        ])
+
+        # Global average pooling branch for image-level context
+        self.global_branch = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, mid, kernel_size=1, bias=False),
+            nn.GELU(),
+        )
+
+        # Fuse all branches back to original channel count
+        self.fuse = nn.Sequential(
+            nn.Conv2d(mid * (len(rates) + 1), channels, kernel_size=1, bias=False),
+            nn.GroupNorm(min(32, channels), channels),
+            nn.GELU(),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        branch_outs = [branch(x) for branch in self.branches]
+
+        # Global context — broadcast to spatial dims
+        global_ctx = self.global_branch(x)
+        global_ctx = F.interpolate(
+            global_ctx, size=x.shape[2:], mode="bilinear", align_corners=False,
+        )
+        branch_outs.append(global_ctx)
+
+        fused = self.fuse(torch.cat(branch_outs, dim=1))
+        return x + fused  # Residual connection
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # UNet++ Decoder
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -128,6 +206,9 @@ class UNetPPDecoder(nn.Module):
         self.deep_supervision = deep_supervision
         d = decoder_dim
         e = encoder_dims  # (96, 192, 384, 768)
+
+        # ── Dilated context at bottleneck (long-range impact) ──
+        self.context = DilatedContextModule(e[3])
 
         # ── Row 2 (depth=2): one node ──
         # X_{2,1}: upsample X_{3,0} + skip X_{2,0}
@@ -179,6 +260,7 @@ class UNetPPDecoder(nn.Module):
                 nn.Sequential(
                     _BilinearUp2x(),
                     nn.Conv2d(d, d // 2, 3, padding=1, bias=False),
+                    nn.GroupNorm(min(16, d // 2), d // 2),
                     nn.GELU(),
                     _BilinearUp2x(),
                     nn.Conv2d(d // 2, 1, 1),
@@ -211,6 +293,9 @@ class UNetPPDecoder(nn.Module):
         x10 = features["s2"]  # [B, 192, H/8,  W/8]
         x20 = features["s3"]  # [B, 384, H/16, W/16]
         x30 = features["s4"]  # [B, 768, H/32, W/32]
+
+        # Apply dilated context for long-range impact propagation
+        x30 = self.context(x30)
 
         # ── Row 2 ──
         x21 = self.conv_21(torch.cat([
@@ -247,13 +332,15 @@ class UNetPPDecoder(nn.Module):
 
         # ── Final upsample (H/4 → H) and prediction ──
         out = self.final_up(x03)
-        out = torch.sigmoid(self.head(out))
+        # ReLU + clamp for sharper gradients on near-zero impact deltas
+        # (sigmoid plateaus make it hard to distinguish small differences)
+        out = torch.clamp(F.relu(self.head(out)), 0.0, 1.0)
 
         if return_deep and self.deep_supervision:
             deep = [
-                torch.sigmoid(self.ds_heads[0](x01)),
-                torch.sigmoid(self.ds_heads[1](x02)),
-                torch.sigmoid(self.ds_heads[2](x03)),
+                torch.clamp(F.relu(self.ds_heads[0](x01)), 0.0, 1.0),
+                torch.clamp(F.relu(self.ds_heads[1](x02)), 0.0, 1.0),
+                torch.clamp(F.relu(self.ds_heads[2](x03)), 0.0, 1.0),
             ]
             return out, deep
 

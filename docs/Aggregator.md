@@ -2,7 +2,9 @@
 
 ## Overview
 
-The Conditioned Aggregator fuses 4 domain-specific risk masks into a unified harm mask, conditioned on user-provided priority weights. It uses a **hybrid** approach that guarantees weight sensitivity while allowing learned cross-domain interactions.
+The Conditioned Aggregator fuses 4 domain-specific **impact masks** into a unified harm mask, conditioned on user-provided priority weights. It uses a **hybrid** approach that guarantees weight sensitivity while allowing learned cross-domain interactions.
+
+> **Note**: With the counterfactual model overhaul, each domain mask now represents the **predicted impact of deforestation** (not static risk). The aggregator combines these impact deltas to show where clearing would cause the most total environmental damage.
 
 ## Design Philosophy
 
@@ -45,7 +47,7 @@ harm = Σ(w_norm_i * mask_i)
 Optional cross-domain interaction network:
 - `Conv1×1(4→32) + GELU + Conv1×1(32→16) + GELU + Conv1×1(16→1)`
 - Scale parameter initialized to 0 — **outputs nothing without training**
-- When trained, captures non-linear interactions (e.g., fire × low moisture → amplified risk)
+- When trained, captures non-linear interactions (e.g., fire impact × soil impact → amplified harm)
 - ~700 parameters
 
 ### 3. Gaussian Smoothing

@@ -1,18 +1,19 @@
 """
-HydroRiskNet — Water-Pollution Risk Model
-============================================
-ConvNeXt-V2 + UNet++ for continuous water-pollution / erosion risk
-estimation from terrain and hydrological data.
+HydroImpactNet — Water-Pollution Impact Model
+================================================
+ConvNeXt-V2 + UNet++ for predicting how deforestation increases
+downstream water pollution / erosion risk.
 
-Input  : [B, T, 5, 256, 256]  or  [B, 5, 256, 256]
-Output : [B, 1, 256, 256]  (water-pollution risk, sigmoid, [0, 1])
+Input  : [B, T, 6, 256, 256]  or  [B, 6, 256, 256]
+Output : [B, 1, 256, 256]  (water-pollution impact delta, [0, 1])
 
-Channels (5):
+Channels (6):
     0: elevation (DEM, normalised)
     1: slope (degrees, normalised)
     2: aspect (sin-encoded)
     3: flow_accumulation (log-normalised)
     4: forest_cover (canopy %, deforestation-aware)
+    5: deforestation_mask (binary: 1=cleared between T₁ and T₂)
 """
 
 from __future__ import annotations
@@ -22,8 +23,12 @@ from models.base_model import DomainRiskNet
 
 
 class HydroRiskNet(DomainRiskNet):
-    """ConvNeXt-V2 + UNet++ for continuous water-pollution risk."""
-    IN_CHANNELS: int = 5
+    """ConvNeXt-V2 + UNet++ for water-pollution impact prediction.
+
+    Predicts how much downstream erosion/runoff risk increases
+    when the indicated upstream tiles are cleared.
+    """
+    IN_CHANNELS: int = 6
 
 
 if __name__ == "__main__":
@@ -31,7 +36,7 @@ if __name__ == "__main__":
     params = sum(p.numel() for p in model.parameters())
     print(f"HydroRiskNet parameters: {params:,}")
 
-    x = torch.randn(1, 5, 256, 256)
+    x = torch.randn(1, 6, 256, 256)
     y = model(x)
     print(f"Single frame: {y.shape}  [{y.min():.3f}, {y.max():.3f}]")
 

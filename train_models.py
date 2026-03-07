@@ -44,9 +44,7 @@ from datasets.hansen_gfc import HansenGFCDataset
 from datasets.srtm_hydro import SRTMHydroDataset
 from datasets.smap_soil import SMAPSoilDataset
 from losses import (
-    FocalBCELoss,
-    DiceBCELoss,
-    GradientMSELoss,
+    EdgeWeightedMSELoss,
     SmoothMSELoss,
     DeepSupervisionWrapper,
 )
@@ -175,30 +173,30 @@ MODEL_CONFIGS: Dict[str, Dict] = {
     "fire": {
         "model_class": FireRiskNet,
         "dataset_class": VIIRSFireDataset,
-        "loss_class": FocalBCELoss,
+        "loss_class": EdgeWeightedMSELoss,
         "lr": 5e-4,
-        "description": "VIIRS Active Fire Detection",
+        "description": "Fire Impact (counterfactual)",
     },
     "forest": {
         "model_class": ForestLossNet,
         "dataset_class": HansenGFCDataset,
-        "loss_class": DiceBCELoss,
+        "loss_class": EdgeWeightedMSELoss,
         "lr": 5e-4,
-        "description": "Hansen Forest Loss Detection",
+        "description": "Cascade Deforestation Impact (counterfactual)",
     },
     "hydro": {
         "model_class": HydroRiskNet,
         "dataset_class": SRTMHydroDataset,
-        "loss_class": GradientMSELoss,
+        "loss_class": EdgeWeightedMSELoss,
         "lr": 3e-4,
-        "description": "SRTM/HydroSHEDS Water-Pollution Risk",
+        "description": "Erosion Impact (counterfactual)",
     },
     "soil": {
         "model_class": SoilRiskNet,
         "dataset_class": SMAPSoilDataset,
-        "loss_class": SmoothMSELoss,
+        "loss_class": EdgeWeightedMSELoss,
         "lr": 5e-4,
-        "description": "SMAP Soil Degradation Risk",
+        "description": "Soil Degradation Impact (counterfactual)",
     },
 }
 
@@ -229,13 +227,13 @@ def train_single_model(
 
     train_dataset = AugmentedDataset(
         cfg["dataset_class"](
-            num_samples=train_samples, spatial_size=256, seed=42
+            num_samples=train_samples, image_size=256, seed=42
         ),
         augment=True,
     )
     val_dataset = AugmentedDataset(
         cfg["dataset_class"](
-            num_samples=val_samples, spatial_size=256, seed=10000
+            num_samples=val_samples, image_size=256, seed=10000
         ),
         augment=False,
     )

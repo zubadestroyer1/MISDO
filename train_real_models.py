@@ -15,10 +15,10 @@ Features:
     - Checkpoint saving (best model by test loss)
     - MPS-safe DataLoader settings
 
-Temporal Split Strategy:
-    Train:    spatial "train" tiles, years 2001–2018
-    Test:     spatial "train" tiles, years 2019–2020 (monitoring)
-    Validate: spatial "test" tiles, years 2021–2023 (true hold-out)
+Temporal Split Strategy (strict, no overlap):
+    Train:    spatial "train" tiles, events years 2001–2016
+    Test:     spatial "train" tiles, events years 2017–2018 (checkpoint selection)
+    Validate: spatial "test" tiles, events years 2019–2021 (true hold-out)
 
 Usage:
     python train_real_models.py --model all --epochs 60
@@ -48,12 +48,10 @@ from datasets.real_datasets import (
     RealHansenDataset,
     RealHydroDataset,
     RealSoilDataset,
+    compute_global_target_scale,
 )
 from losses import (
-    FocalBCELoss,
-    DiceBCELoss,
-    GradientMSELoss,
-    SmoothMSELoss,
+    CounterfactualDeltaLoss,
     DeepSupervisionWrapper,
 )
 from models.fire_model import FireRiskNet
@@ -69,30 +67,27 @@ from models.soil_model import SoilRiskNet
 class RandomFlipRotate:
     """Random augmentation: horizontal/vertical flips + 90° rotations.
 
-    Applied identically to both input and target tensors.
+    Applied identically to all input and target tensors.
     Supports both [B, C, H, W] and [B, T, C, H, W] temporal inputs.
     """
 
     def __call__(
-        self, obs: torch.Tensor, target: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self, *tensors: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
         # Random horizontal flip
         if torch.rand(1).item() > 0.5:
-            obs = torch.flip(obs, [-1])
-            target = torch.flip(target, [-1])
+            tensors = tuple(torch.flip(t, [-1]) for t in tensors)
 
         # Random vertical flip
         if torch.rand(1).item() > 0.5:
-            obs = torch.flip(obs, [-2])
-            target = torch.flip(target, [-2])
+            tensors = tuple(torch.flip(t, [-2]) for t in tensors)
 
         # Random 90° rotation (0, 90, 180, or 270°)
         k = torch.randint(0, 4, (1,)).item()
         if k > 0:
-            obs = torch.rot90(obs, k, [-2, -1])
-            target = torch.rot90(target, k, [-2, -1])
+            tensors = tuple(torch.rot90(t, k, [-2, -1]) for t in tensors)
 
-        return obs, target
+        return tensors
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -165,35 +160,35 @@ class WarmupCosineScheduler:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Training
+# Training — Counterfactual Impact Models
 # ═══════════════════════════════════════════════════════════════════
 
 MODEL_CONFIGS = {
     "fire": {
         "model_cls": FireRiskNet,
         "dataset_cls": RealFireDataset,
-        "loss_cls": FocalBCELoss,
+        "loss_cls": CounterfactualDeltaLoss,
         "temporal": True,
         "lr": 3e-4,
     },
     "forest": {
         "model_cls": ForestLossNet,
         "dataset_cls": RealHansenDataset,
-        "loss_cls": DiceBCELoss,
+        "loss_cls": CounterfactualDeltaLoss,
         "temporal": True,
         "lr": 3e-4,
     },
     "hydro": {
         "model_cls": HydroRiskNet,
         "dataset_cls": RealHydroDataset,
-        "loss_cls": GradientMSELoss,
+        "loss_cls": CounterfactualDeltaLoss,
         "temporal": False,
         "lr": 1e-3,
     },
     "soil": {
         "model_cls": SoilRiskNet,
         "dataset_cls": RealSoilDataset,
-        "loss_cls": SmoothMSELoss,
+        "loss_cls": CounterfactualDeltaLoss,
         "temporal": True,
         "lr": 1e-3,
     },
@@ -223,25 +218,36 @@ def train_single_model(
         Early stopping patience — stop training if test loss hasn't
         improved for this many consecutive epochs (default 10).
     """
-    # ── Temporal Split Strategy ──────────────────────────────────────
-    # Train:    spatial "train" tiles, years 2001-2018  (year_start=1, end=18)
-    # Test:     spatial "train" tiles, years 2014-2020  (year_start=14, end=20)
-    #           → context uses recent history, TARGET (predicted period)
-    #             is years 2019-2020 which is non-overlapping with train
-    # Validate: spatial "test" tiles,  years 2018-2023  (year_start=18, end=23)
+    # ── Strict Temporal Split Strategy ────────────────────────────────
+    # Train:    spatial "train" tiles, events years 1-16, impact by 18
+    # Test:     spatial "train" tiles, events years 17-18, impact by 20
+    #           → same locations but STRICTLY non-overlapping event years
+    # Validate: spatial "test" tiles,  events years 19-21, impact by 23
     #           → true hold-out: unseen locations AND unseen time period
     # ──────────────────────────────────────────────────────────────────
+
+    # ── Compute global target scale ───────────────────────────────────
+    # Pre-scan chips to find a consistent normalisation scale so that
+    # target magnitudes are comparable across chips.
+    print(f"  Computing global target scale for {name}...")
+    target_scale = compute_global_target_scale(name, tiles_dir, split="train")
 
     # Dataset
     DatasetCls = config["dataset_cls"]
     if config["temporal"]:
-        train_ds = DatasetCls(tiles_dir=tiles_dir, split="train", T=5, train_end_year=18)
-        test_ds = DatasetCls(tiles_dir=tiles_dir, split="train", T=5, train_end_year=20, year_start=14)
-        val_ds = DatasetCls(tiles_dir=tiles_dir, split="test", T=5, train_end_year=23, year_start=18)
+        train_ds = DatasetCls(tiles_dir=tiles_dir, split="train", T=5, train_end_year=18,
+                              temporal_split="train", target_scale=target_scale)
+        test_ds  = DatasetCls(tiles_dir=tiles_dir, split="train", T=5, train_end_year=20,
+                              year_start=15, temporal_split="test", target_scale=target_scale)
+        val_ds   = DatasetCls(tiles_dir=tiles_dir, split="test",  T=5, train_end_year=23,
+                              year_start=17, temporal_split="validate", target_scale=target_scale)
     else:
-        train_ds = DatasetCls(tiles_dir=tiles_dir, split="train", train_end_year=18)
-        test_ds = DatasetCls(tiles_dir=tiles_dir, split="train", train_end_year=20)
-        val_ds = DatasetCls(tiles_dir=tiles_dir, split="test", train_end_year=23)
+        train_ds = DatasetCls(tiles_dir=tiles_dir, split="train", train_end_year=18,
+                              temporal_split="train", target_scale=target_scale)
+        test_ds  = DatasetCls(tiles_dir=tiles_dir, split="train", train_end_year=20,
+                              temporal_split="test", target_scale=target_scale)
+        val_ds   = DatasetCls(tiles_dir=tiles_dir, split="test",  train_end_year=23,
+                              temporal_split="validate", target_scale=target_scale)
 
     batch_size = 16 if device.type == "cuda" else 2
     dl_kwargs = _get_dataloader_kwargs(device)
@@ -261,7 +267,7 @@ def train_single_model(
     model = config["model_cls"]().to(device)
     params = sum(p.numel() for p in model.parameters())
     print(f"  Parameters: {params:,}")
-    print(f"  Temporal split: train ≤2018 | test 2014–2020 | validate 2018–2023")
+    print(f"  Strict temporal split: train events ≤2016 | test events 2017–2018 | validate events 2019–2021")
     print(f"  Train: {len(train_ds)}, Test: {len(test_ds)}, Validate: {len(val_ds)}")
     print(f"  Effective batch size: {effective_batch}")
 
@@ -295,46 +301,46 @@ def train_single_model(
         scheduler.step(epoch)
         current_lr = optimizer.param_groups[0]["lr"]
 
-        # ── Train ──
+        # Reproducible per-epoch randomisation
+        if hasattr(train_ds, "set_epoch"):
+            train_ds.set_epoch(epoch)
+
+        # ── Train (Siamese counterfactual) ──
         model.train()
         epoch_loss = 0.0
         n_batches = 0
         optimizer.zero_grad()
 
-        for batch_idx, (obs, target) in enumerate(train_loader):
-            obs = obs.to(device, non_blocking=dl_kwargs.get("pin_memory", False))
+        for batch_idx, (obs_f, obs_cf, target) in enumerate(train_loader):
+            obs_f = obs_f.to(device, non_blocking=dl_kwargs.get("pin_memory", False))
+            obs_cf = obs_cf.to(device, non_blocking=dl_kwargs.get("pin_memory", False))
             target = target.to(device, non_blocking=dl_kwargs.get("pin_memory", False))
 
-            # Data augmentation
-            obs, target = augment(obs, target)
+            # Data augmentation — same transform applied to all 3 tensors
+            obs_f, obs_cf, target = augment(obs_f, obs_cf, target)
 
             # Forward pass with optional AMP
             with torch.amp.autocast(device_type=amp_device_type, enabled=amp_enabled):
-                # Forward with deep supervision for auxiliary losses
-                bottleneck, skips = model.encode(obs)
-                features = {"s1": skips["s1"], "s2": skips["s2"], "s3": skips["s3"], "s4": bottleneck}
-                pred_result = model.decoder(features, return_deep=True)
-
-                if isinstance(pred_result, tuple):
-                    pred, deep_outputs = pred_result
-                else:
-                    pred, deep_outputs = pred_result, None
+                # Siamese paired forward with deep supervision
+                pred_delta, deep_deltas = model.forward_paired_deep(
+                    obs_f, obs_cf
+                )
 
                 # Shape assertion
-                assert pred.shape[0] == target.shape[0], (
-                    f"Batch size mismatch: pred {pred.shape} vs target {target.shape}"
+                assert pred_delta.shape[0] == target.shape[0], (
+                    f"Batch size mismatch: pred {pred_delta.shape} vs target {target.shape}"
                 )
                 # Ensure spatial dims match (resize target if needed)
-                if pred.shape[2:] != target.shape[2:]:
+                if pred_delta.shape[2:] != target.shape[2:]:
                     target = F.interpolate(
-                        target, size=pred.shape[2:],
+                        target, size=pred_delta.shape[2:],
                         mode="bilinear", align_corners=False,
                     )
                 # Ensure channel dim matches
-                if pred.shape[1] != target.shape[1]:
-                    target = target[:, :pred.shape[1]]
+                if pred_delta.shape[1] != target.shape[1]:
+                    target = target[:, :pred_delta.shape[1]]
 
-                loss = criterion(pred, target, deep_outputs)
+                loss = criterion(pred_delta, target, deep_deltas)
 
                 # Scale loss by accumulation steps for correct gradient magnitude
                 loss = loss / accumulation_steps
@@ -356,24 +362,25 @@ def train_single_model(
         avg_train = epoch_loss / max(n_batches, 1)
         train_losses.append(avg_train)
 
-        # ── Test (2019-2020 temporal window, same spatial tiles) ──
+        # ── Test (Siamese paired forward) ──
         model.eval()
         test_loss = 0.0
         n_test = 0
         with torch.no_grad():
-            for obs, target in test_loader:
-                obs = obs.to(device)
+            for obs_f, obs_cf, target in test_loader:
+                obs_f = obs_f.to(device)
+                obs_cf = obs_cf.to(device)
                 target = target.to(device)
-                pred = model(obs)
-                if pred.shape[2:] != target.shape[2:]:
+                pred_delta = model.forward_paired(obs_f, obs_cf)
+                if pred_delta.shape[2:] != target.shape[2:]:
                     target = F.interpolate(
-                        target, size=pred.shape[2:],
+                        target, size=pred_delta.shape[2:],
                         mode="bilinear", align_corners=False,
                     )
-                if pred.shape[1] != target.shape[1]:
-                    target = target[:, :pred.shape[1]]
+                if pred_delta.shape[1] != target.shape[1]:
+                    target = target[:, :pred_delta.shape[1]]
                 # Test loss without deep supervision (main output only)
-                test_loss += base_criterion(pred, target).item()
+                test_loss += base_criterion(pred_delta, target).item()
                 n_test += 1
 
         avg_test = test_loss / max(n_test, 1)
@@ -401,7 +408,7 @@ def train_single_model(
                   f"(no improvement for {patience} epochs)")
             break
 
-    # ── Final Validation (2021+, held-out spatial tiles) ──
+    # ── Final Validation (2021+, held-out spatial tiles, Siamese) ──
     print(f"\n  ── Final Validation (2021+, held-out tiles) ──")
     model.load_state_dict(torch.load(
         os.path.join(weights_dir, f"{name}_model.pt"),
@@ -412,20 +419,21 @@ def train_single_model(
     total_dice = 0.0
     n_samples = 0
     with torch.no_grad():
-        for obs, target in val_loader:
-            obs = obs.to(device)
+        for obs_f, obs_cf, target in val_loader:
+            obs_f = obs_f.to(device)
+            obs_cf = obs_cf.to(device)
             target = target.to(device)
-            pred = model(obs)
-            if pred.shape[2:] != target.shape[2:]:
+            pred_delta = model.forward_paired(obs_f, obs_cf)
+            if pred_delta.shape[2:] != target.shape[2:]:
                 target = F.interpolate(
-                    target, size=pred.shape[2:],
+                    target, size=pred_delta.shape[2:],
                     mode="bilinear", align_corners=False,
                 )
-            if pred.shape[1] != target.shape[1]:
-                target = target[:, :pred.shape[1]]
+            if pred_delta.shape[1] != target.shape[1]:
+                target = target[:, :pred_delta.shape[1]]
 
-            total_mse += F.mse_loss(pred, target).item()
-            p, t = pred.flatten(), target.flatten()
+            total_mse += F.mse_loss(pred_delta, target).item()
+            p, t = pred_delta.flatten(), target.flatten()
             intersection = (p * t).sum()
             dice = (2 * intersection + 1) / (p.sum() + t.sum() + 1)
             total_dice += dice.item()
@@ -443,7 +451,7 @@ def train_single_model(
         "effective_batch_size": effective_batch,
         "warmup_epochs": warmup_epochs,
         "amp_enabled": use_amp,
-        "temporal_split": {"train": "2001-2018", "test": "2019-2020", "validate": "2021-2023"},
+        "temporal_split": {"train": "events 2001-2016", "test": "events 2017-2018", "validate": "events 2019-2021"},
         "final_train_loss": round(train_losses[-1], 6),
         "best_test_loss": round(best_test_loss, 6),
         "val_mse": val_mse,

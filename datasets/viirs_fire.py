@@ -1,123 +1,108 @@
 """
-VIIRS VNP14IMG Active Fire Dataset
-===================================
-Generates synthetic data matching VIIRS I-band structure.
+VIIRS Fire Dataset — Counterfactual Fire Impact (Synthetic)
+=============================================================
+Generates synthetic fire data where the target is the INCREASE in
+fire risk in surrounding forest caused by deforestation, not just
+existing fire locations.
 
-Channels (6):
-    0: I1 (0.64 µm visible reflectance)         — [0, 1]
-    1: I2 (0.86 µm NIR reflectance)              — [0, 1]
-    2: I3 (1.61 µm SWIR reflectance)             — [0, 1]
-    3: I4 (3.74 µm MIR brightness temp, norm)    — [0, 1] (maps ~250–500 K)
-    4: I5 (11.45 µm TIR brightness temp, norm)   — [0, 1] (maps ~200–350 K)
-    5: FRP (fire radiative power, norm)           — [0, 1]
-
-Target: Binary fire mask [1, 256, 256] derived from I4 brightness temperature
-        exceedance over contextual background.
+Input:  [B, 7, H, W]  — 6 fire features + deforestation mask
+Target: [B, 1, H, W]  — fire impact delta [0, 1]
 """
 
 from __future__ import annotations
-
 from typing import Tuple
 
+import numpy as np
 import torch
-import torch.nn.functional as F
+from scipy.ndimage import binary_dilation, gaussian_filter
 from torch import Tensor
 from torch.utils.data import Dataset
 
-# Physical constants (normalized to [0, 1])
-_BG_I4: float = 0.3    # background MIR BT (~310 K normalised)
-_BG_I5: float = 0.45   # background TIR BT (~280 K normalised)
-_FIRE_I4: float = 0.85  # fire MIR BT (~450 K normalised)
-_FIRE_I5: float = 0.65  # fire TIR BT (~320 K normalised)
-
 
 class VIIRSFireDataset(Dataset):
-    """Synthetic VIIRS active-fire dataset with realistic spatial hotspots.
+    """Synthetic VIIRS fire dataset for counterfactual impact training.
 
-    Fire locations are generated as Gaussian clusters to mimic real wildfire
-    point-spread patterns at 375 m resolution.
+    Generates landscapes with deforestation events and computes
+    how fire risk INCREASES near clearings (dry edges, debris fuel,
+    wind exposure).
     """
-
-    NUM_CHANNELS: int = 6
 
     def __init__(
         self,
-        num_samples: int = 64,
-        spatial_size: int = 256,
+        num_samples: int = 256,
+        image_size: int = 256,
         seed: int = 42,
     ) -> None:
-        super().__init__()
         self.num_samples = num_samples
-        self.spatial_size = spatial_size
+        self.image_size = image_size
         self.seed = seed
 
     def __len__(self) -> int:
         return self.num_samples
 
     def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor]:
-        S = self.spatial_size
-        g = torch.Generator().manual_seed(self.seed + idx)
+        rng = np.random.RandomState(self.seed + idx)
+        H = W = self.image_size
 
-        # --- Background layers ---
-        # Visible / NIR / SWIR — spatially correlated vegetation reflectance
-        base_veg = torch.rand(1, S, S, generator=g) * 0.4 + 0.2  # [0.2, 0.6]
-        noise = torch.randn(3, S, S, generator=g) * 0.05
-        i1 = (base_veg * 0.5 + noise[0:1]).clamp(0, 1)   # visible — lower
-        i2 = (base_veg * 0.9 + noise[1:2]).clamp(0, 1)    # NIR — higher for veg
-        i3 = (base_veg * 0.3 + noise[2:3]).clamp(0, 1)    # SWIR — moderate
+        # Generate forest cover with natural variation
+        base_cover = rng.uniform(0.4, 0.9)
+        forest = np.clip(
+            gaussian_filter(rng.randn(H, W), sigma=20) * 0.3 + base_cover,
+            0, 1,
+        ).astype(np.float32)
 
-        # Brightness temperatures — background
-        i4 = torch.full((1, S, S), _BG_I4) + torch.randn(1, S, S, generator=g) * 0.03
-        i5 = torch.full((1, S, S), _BG_I5) + torch.randn(1, S, S, generator=g) * 0.03
+        # Generate deforestation patches
+        deforestation_mask = np.zeros((H, W), dtype=np.float32)
+        n_patches = rng.randint(1, 5)
+        for _ in range(n_patches):
+            cx, cy = rng.randint(30, H - 30), rng.randint(30, W - 30)
+            rx, ry = rng.randint(5, 25), rng.randint(5, 25)
+            yy, xx = np.ogrid[-cx:H - cx, -cy:W - cy]
+            mask = (xx ** 2 / (ry ** 2 + 1e-8) + yy ** 2 / (rx ** 2 + 1e-8)) < 1
+            deforestation_mask[mask] = 1.0
 
-        # FRP — background near zero
-        frp = torch.zeros(1, S, S)
+        # Create cleared landscape
+        cleared_forest = forest.copy()
+        cleared_forest[deforestation_mask > 0.5] = 0.0
 
-        # --- Generate fire clusters ---
-        fire_mask = torch.zeros(1, S, S)
-        n_clusters = torch.randint(2, 8, (1,), generator=g).item()
+        # Fire-related input channels
+        non_forest = cleared_forest < 0.3
+        edge_zone = binary_dilation(non_forest, iterations=3).astype(np.float32)
+        exposure = edge_zone * (cleared_forest > 0.3).astype(np.float32)
+        dryness = 1.0 - cleared_forest
+        brightness = rng.uniform(0.2, 0.8) * np.ones((H, W), dtype=np.float32)
+        frp_proxy = dryness * rng.uniform(0.1, 0.5)
 
-        for _ in range(n_clusters):
-            cx = torch.randint(20, S - 20, (1,), generator=g).item()
-            cy = torch.randint(20, S - 20, (1,), generator=g).item()
-            sigma = torch.rand(1, generator=g).item() * 8 + 3  # 3–11 px spread
+        # Stack: [7, H, W]
+        obs = np.stack([
+            cleared_forest, np.zeros_like(forest),  # forest, recent_loss
+            exposure, dryness,  # exposure, dryness
+            brightness, frp_proxy,  # brightness proxy, FRP proxy
+            deforestation_mask,  # deforestation mask
+        ], axis=0)
 
-            yy, xx = torch.meshgrid(
-                torch.arange(S, dtype=torch.float32),
-                torch.arange(S, dtype=torch.float32),
-                indexing="ij",
-            )
-            gaussian = torch.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * sigma ** 2))
-            fire_mask[0] = torch.max(fire_mask[0], gaussian)
+        # ── Counterfactual fire target ──
+        # Fire risk increases near clearing edges (dry, wind-exposed forest)
+        near_clearing = binary_dilation(
+            deforestation_mask > 0.5, iterations=10
+        ).astype(np.float32)
 
-        # Threshold to get binary fire pixels
-        fire_binary = (fire_mask > 0.3).float()
-        fire_soft = fire_mask.clamp(0, 1)
+        # Impact = proximity to clearing × dryness × slope-like factor
+        forest_mask = (cleared_forest > 0.3).astype(np.float32)
+        fire_impact = near_clearing * forest_mask * dryness
 
-        # --- Apply fire signatures to bands ---
-        i4 = i4 + fire_soft * (_FIRE_I4 - _BG_I4)
-        i5 = i5 + fire_soft * (_FIRE_I5 - _BG_I5)
-        frp = fire_soft * (torch.rand(1, S, S, generator=g) * 0.5 + 0.5)
+        # Add stochastic variation
+        noise = gaussian_filter(rng.randn(H, W) * 0.1, sigma=5)
+        fire_impact = np.clip(fire_impact + noise, 0, None)
 
-        # Burnt scar: reduce visible reflectance near fires
-        i1 = (i1 * (1 - fire_soft * 0.5)).clamp(0, 1)
-        i2 = (i2 * (1 - fire_soft * 0.6)).clamp(0, 1)
+        fi_max = fire_impact.max()
+        if fi_max > 1e-8:
+            fire_impact = fire_impact / fi_max
 
-        # Clamp all
-        observation = torch.cat([
-            i1.clamp(0, 1),
-            i2.clamp(0, 1),
-            i3.clamp(0, 1),
-            i4.clamp(0, 1),
-            i5.clamp(0, 1),
-            frp.clamp(0, 1),
-        ], dim=0)  # [6, S, S]
+        fire_impact = gaussian_filter(fire_impact, sigma=2.0)
+        target = np.clip(fire_impact, 0, 1)[np.newaxis, :, :]
 
-        return observation, fire_binary  # [6, 256, 256], [1, 256, 256]
-
-
-if __name__ == "__main__":
-    ds = VIIRSFireDataset(num_samples=4, seed=0)
-    obs, tgt = ds[0]
-    print(f"VIIRS obs: {obs.shape}  min={obs.min():.3f}  max={obs.max():.3f}")
-    print(f"VIIRS tgt: {tgt.shape}  fire_pixels={tgt.sum().item():.0f}")
+        return (
+            torch.from_numpy(obs.astype(np.float32)),
+            torch.from_numpy(target.astype(np.float32)),
+        )

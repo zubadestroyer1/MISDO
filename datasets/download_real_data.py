@@ -833,15 +833,18 @@ def download_tile(
     tile_name: str,
     tile_info: Dict,
     output_dir: str,
+    split: str = "train",
     chips_per_tile: int = 500,
     chip_size: int = 256,
     min_forest_pct: float = 0.20,
     max_forest_pct: float = 0.95,
-    train_ratio: float = 0.8,
     srtm_cache_dir: str = "",
     firms_key: Optional[str] = None,
-) -> Tuple[List[Dict], List[Dict]]:
+) -> List[Dict]:
     """Download chips from a single Hansen GFC tile with SRTM + VIIRS.
+
+    ALL chips from this tile go into a SINGLE split to prevent
+    spatial data leakage.  Tile-level splitting is done in download_all().
 
     Chips with forest cover above max_forest_pct are skipped because
     pristine-forest chips have near-zero deforestation labels (empty targets).
@@ -851,7 +854,7 @@ def download_tile(
 
     tile_code = tile_info["tile"]
     print(f"\n  [{tile_name}] {tile_info['region']} — {tile_info['description']}")
-    print(f"    Tile: {tile_code}  |  Target: {chips_per_tile} chips")
+    print(f"    Tile: {tile_code}  |  Target: {chips_per_tile} chips  |  Split: {split}")
     srtm_status = "✓ Real SRTM" if srtm_cache_dir else "Proxy"
     viirs_status = "✓ Real VIIRS" if firms_key else "No VIIRS"
     print(f"    Data: {srtm_status} | {viirs_status}")
@@ -887,56 +890,42 @@ def download_tile(
                     continue
     except Exception as e:
         print(f"    ✗ Cannot access tile {tile_code}: {e}")
-        return [], []
+        return []
 
     if not good_positions:
         print(f"    ✗ No suitable chips found")
-        return [], []
+        return []
 
-    # Random spatial split — avoids the bias of putting densest chips
-    # in train and sparsest in test.  Seeded by tile name for reproducibility.
-    rng = np.random.RandomState(hash(tile_name) % 2**31)
-    rng.shuffle(good_positions)
-    n_train = int(len(good_positions) * train_ratio)
-    train_positions = good_positions[:n_train]
-    test_positions = good_positions[n_train:]
+    print(f"    Found {len(good_positions)} chips → all assigned to '{split}'")
 
-    print(f"    Found {len(good_positions)} chips: {len(train_positions)} train, {len(test_positions)} test")
+    entries = []
+    split_dir = os.path.join(output_dir, split)
+    os.makedirs(split_dir, exist_ok=True)
 
-    train_entries = []
-    test_entries = []
+    for idx, (px, py, fc) in enumerate(good_positions):
+        chip_name = f"{tile_name}_chip_{idx:03d}"
+        chip_file = os.path.join(split_dir, f"{chip_name}.npz")
 
-    for split, positions, entries in [
-        ("train", train_positions, train_entries),
-        ("test", test_positions, test_entries),
-    ]:
-        split_dir = os.path.join(output_dir, split)
-        os.makedirs(split_dir, exist_ok=True)
+        # Store path relative to output_dir for portability
+        rel_path = os.path.relpath(chip_file, output_dir)
 
-        for idx, (px, py, fc) in enumerate(positions):
-            chip_name = f"{tile_name}_chip_{idx:03d}"
-            chip_file = os.path.join(split_dir, f"{chip_name}.npz")
+        result = _download_single_chip(
+            tile_name, tile_code, px, py, chip_size, chip_file,
+            srtm_cache_dir, firms_key,
+        )
+        if result:
+            result["file"] = rel_path    # overwrite with portable relative path
+            result["forest_pct"] = round(fc, 3)
+            result["biome"] = tile_info["biome"]
+            result["region"] = tile_info["region"]
+            entries.append(result)
 
-            # Store path relative to output_dir for portability
-            rel_path = os.path.relpath(chip_file, output_dir)
-
-            result = _download_single_chip(
-                tile_name, tile_code, px, py, chip_size, chip_file,
-                srtm_cache_dir, firms_key,
-            )
-            if result:
-                result["file"] = rel_path    # overwrite with portable relative path
-                result["forest_pct"] = round(fc, 3)
-                result["biome"] = tile_info["biome"]
-                result["region"] = tile_info["region"]
-                entries.append(result)
-
-    n_srtm = sum(1 for e in train_entries + test_entries if e.get("has_real_srtm"))
-    n_viirs = sum(1 for e in train_entries + test_entries if e.get("has_real_viirs"))
-    print(f"    ✓ Downloaded {len(train_entries)} train + {len(test_entries)} test"
+    n_srtm = sum(1 for e in entries if e.get("has_real_srtm"))
+    n_viirs = sum(1 for e in entries if e.get("has_real_viirs"))
+    print(f"    ✓ Downloaded {len(entries)} chips to '{split}'"
           f"  (SRTM: {n_srtm}, VIIRS: {n_viirs})")
 
-    return train_entries, test_entries
+    return entries
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1091,8 +1080,13 @@ def download_all(
     chips_per_tile: int = 1000,
     parallel: int = 1,
     firms_key: Optional[str] = None,
+    train_ratio: float = 0.8,
 ) -> Dict:
     """Download chips from all tiles in tile_list.
+
+    TILE-LEVEL SPLITTING: entire tiles are assigned to either 'train'
+    or 'test' to prevent spatial data leakage.  No chips from the same
+    tile ever appear in both splits.
 
     Parameters
     ----------
@@ -1100,6 +1094,8 @@ def download_all(
         Each dict must have at least 'tile_code'. May also have
         'forest_pct', 'biome', 'region', etc.
         If None, uses CURATED_TILES.
+    train_ratio : float
+        Fraction of tiles assigned to training (default 0.8).
     """
     # Build tile list from curated registry if not provided
     if tile_list is None:
@@ -1112,22 +1108,44 @@ def download_all(
     srtm_cache_dir = os.path.join(output_dir, ".srtm_cache")
     os.makedirs(srtm_cache_dir, exist_ok=True)
 
-    print(f"\nDownloading {len(tile_list)} tiles × {chips_per_tile} chips/tile")
+    # ── Tile-level spatial split ──────────────────────────────────────
+    # Shuffle tiles with a fixed seed and assign 80% to train, 20% to test.
+    # This ensures ZERO spatial overlap between train and test.
+    rng = np.random.RandomState(42)
+    indices = rng.permutation(len(tile_list))
+    n_train_tiles = max(1, int(len(tile_list) * train_ratio))
+    train_indices = set(indices[:n_train_tiles].tolist())
+
+    # Assign split label to each tile
+    tile_splits = []
+    for i, ti in enumerate(tile_list):
+        split = "train" if i in train_indices else "test"
+        tile_splits.append(split)
+
+    n_train_t = sum(1 for s in tile_splits if s == "train")
+    n_test_t = sum(1 for s in tile_splits if s == "test")
+
+    print(f"\nTile-level spatial split: {n_train_t} train tiles, "
+          f"{n_test_t} test tiles (ratio={train_ratio})")
+    print(f"Downloading {len(tile_list)} tiles × {chips_per_tile} chips/tile")
     print(f"Target: ~{len(tile_list) * chips_per_tile:,} total chips")
     print(f"SRTM: ✓ Real elevation (cached to {srtm_cache_dir})")
     print(f"VIIRS: {'✓ Real fire data (FIRMS API)' if firms_key else '✗ No MAP_KEY — fire data skipped'}\n")
 
     manifest: Dict[str, Any] = {"train": [], "test": [], "metadata": {
         "n_tiles": len(tile_list),
+        "n_train_tiles": n_train_t,
+        "n_test_tiles": n_test_t,
         "chips_per_tile": chips_per_tile,
         "has_real_srtm": True,
         "has_real_viirs": bool(firms_key),
+        "split_strategy": "tile-level (no within-tile splitting)",
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }}
 
     os.makedirs(output_dir, exist_ok=True)
 
-    def _download_one_tile(tile_info: Dict):
+    def _download_one_tile(tile_info: Dict, split: str):
         tile_code = tile_info["tile_code"]
         tile_name = tile_info.get("name", f"tile_{tile_code}")
         # Build a tile_info dict compatible with download_tile()
@@ -1137,32 +1155,30 @@ def download_all(
             "region": tile_info.get("region", tile_code),
             "description": tile_info.get("description", ""),
         }
-        return download_tile(
-            tile_name, ti, output_dir, chips_per_tile,
-            256, 0.10, 0.95, 0.8,
+        return split, download_tile(
+            tile_name, ti, output_dir, split, chips_per_tile,
+            256, 0.10, 0.95,
             srtm_cache_dir, firms_key,
         )
 
     if parallel > 1:
         with ThreadPoolExecutor(max_workers=parallel) as executor:
             futures = {
-                executor.submit(_download_one_tile, ti): ti
-                for ti in tile_list
+                executor.submit(_download_one_tile, ti, tile_splits[i]): ti
+                for i, ti in enumerate(tile_list)
             }
             for future in as_completed(futures):
                 ti = futures[future]
                 try:
-                    train_e, test_e = future.result()
-                    manifest["train"].extend(train_e)
-                    manifest["test"].extend(test_e)
+                    split, entries = future.result()
+                    manifest[split].extend(entries)
                 except Exception as e:
                     print(f"  ✗ Tile {ti.get('tile_code', '?')} failed: {e}")
     else:
-        for ti in tile_list:
+        for i, ti in enumerate(tile_list):
             try:
-                train_e, test_e = _download_one_tile(ti)
-                manifest["train"].extend(train_e)
-                manifest["test"].extend(test_e)
+                split, entries = _download_one_tile(ti, tile_splits[i])
+                manifest[split].extend(entries)
             except Exception as e:
                 print(f"  ✗ Tile {ti.get('tile_code', '?')} failed: {e}")
 

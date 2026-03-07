@@ -1,18 +1,19 @@
 """
-ForestLossNet — Deforestation Detection Model
-================================================
-ConvNeXt-V2 + UNet++ for deforestation detection from multi-band
-Landsat-derived imagery.
+ForestImpactNet — Deforestation Cascade Impact Model
+======================================================
+ConvNeXt-V2 + UNet++ for predicting how deforestation at a given
+location triggers cascade forest loss in surrounding areas.
 
-Input  : [B, T, 5, 256, 256]  or  [B, 5, 256, 256]
-Output : [B, 1, 256, 256]  (deforestation risk mask, sigmoid, [0, 1])
+Input  : [B, T, 6, 256, 256]  or  [B, 6, 256, 256]
+Output : [B, 1, 256, 256]  (cascade deforestation risk delta, [0, 1])
 
-Channels (5):
-    0: treecover2000 (percent canopy cover)
-    1: lossyear (year of loss, normalised)
+Channels (6):
+    0: forest_cover (canopy %, deforestation-aware)
+    1: recent_loss (binary: clearing in this timestep)
     2: gain (binary forest gain 2000–2012)
-    3: red band composite (Landsat)
-    4: NIR band composite (Landsat)
+    3: ndvi_proxy (forest_cover * 0.8 + 0.2 * (1 - recent_loss))
+    4: canopy_change (forest delta from previous timestep)
+    5: deforestation_mask (binary: 1=cleared between T₁ and T₂)
 """
 
 from __future__ import annotations
@@ -22,8 +23,13 @@ from models.base_model import DomainRiskNet
 
 
 class ForestLossNet(DomainRiskNet):
-    """ConvNeXt-V2 + UNet++ for binary deforestation segmentation."""
-    IN_CHANNELS: int = 5
+    """ConvNeXt-V2 + UNet++ for cascade deforestation impact.
+
+    Predicts how much additional forest loss occurs in surrounding
+    areas when the indicated tiles are cleared (edge effects,
+    fragmentation pressure, road access).
+    """
+    IN_CHANNELS: int = 6
 
 
 if __name__ == "__main__":
@@ -31,7 +37,7 @@ if __name__ == "__main__":
     params = sum(p.numel() for p in model.parameters())
     print(f"ForestLossNet parameters: {params:,}")
 
-    x = torch.randn(1, 5, 256, 256)
+    x = torch.randn(1, 6, 256, 256)
     y = model(x)
     print(f"Single frame: {y.shape}  [{y.min():.3f}, {y.max():.3f}]")
 

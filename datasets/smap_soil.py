@@ -1,118 +1,110 @@
 """
-SMAP L3 Soil Moisture Dataset
-===============================
-Generates synthetic data matching SMAP radiometer-derived products.
+SMAP Soil Dataset — Counterfactual Soil Impact (Synthetic)
+============================================================
+Generates synthetic soil data where the target is the INCREASE
+in soil degradation caused by deforestation of nearby areas.
 
-Channels (4):
-    0: surface_soil_moisture (m³/m³ normalised) — [0, 1]  (maps 0–0.5 m³/m³)
-    1: vegetation_water_content (kg/m² norm)    — [0, 1]  (maps 0–10 kg/m²)
-    2: soil_temperature (K normalised)          — [0, 1]  (maps 240–330 K)
-    3: freeze_thaw (binary flag)                — {0, 1}
-
-Target: Soil degradation risk [1, 256, 256] — continuous [0, 1], derived from
-        low moisture + high temperature = drought/degradation risk.
+Input:  [B, 5, H, W]  — 4 soil features + deforestation mask
+Target: [B, 1, H, W]  — soil degradation impact delta [0, 1]
 """
 
 from __future__ import annotations
-
 from typing import Tuple
 
+import numpy as np
 import torch
-import torch.nn.functional as F
+from scipy.ndimage import gaussian_filter
 from torch import Tensor
 from torch.utils.data import Dataset
 
 
-def _smooth_field(S: int, g: torch.Generator, base_scale: int = 32) -> Tensor:
-    """Generate spatially-correlated field via upsampled low-res noise."""
-    grid = max(S // base_scale, 2)
-    low = torch.rand(1, 1, grid, grid, generator=g)
-    high = F.interpolate(low, size=(S, S), mode="bilinear", align_corners=False)
-    return high.squeeze()  # [S, S]
-
-
 class SMAPSoilDataset(Dataset):
-    """Synthetic SMAP soil moisture dataset.
+    """Synthetic SMAP soil dataset for counterfactual degradation training.
 
-    Generates spatially-correlated moisture fields with physically-coupled
-    vegetation and temperature layers. Captures the inverse relationship
-    between soil moisture and surface temperature.
+    Generates landscapes with deforestation patches and computes
+    the INCREASE in soil degradation (moisture loss, topsoil erosion)
+    in neighbouring areas caused by the clearing.
     """
-
-    NUM_CHANNELS: int = 4
 
     def __init__(
         self,
-        num_samples: int = 64,
-        spatial_size: int = 256,
+        num_samples: int = 256,
+        image_size: int = 256,
         seed: int = 42,
     ) -> None:
-        super().__init__()
         self.num_samples = num_samples
-        self.spatial_size = spatial_size
+        self.image_size = image_size
         self.seed = seed
 
     def __len__(self) -> int:
         return self.num_samples
 
     def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor]:
-        S = self.spatial_size
-        g = torch.Generator().manual_seed(self.seed + idx)
+        rng = np.random.RandomState(self.seed + idx)
+        H = W = self.image_size
 
-        # --- Base moisture field (spatially correlated) ---
-        moisture_base = _smooth_field(S, g, base_scale=32)
-        # Add fine-scale variability
-        fine_noise = torch.rand(S, S, generator=g) * 0.1
-        moisture = (moisture_base * 0.8 + fine_noise).clamp(0, 1)
+        # Forest cover
+        forest = np.clip(
+            gaussian_filter(rng.randn(H, W), sigma=20) * 0.3 + 0.65,
+            0, 1,
+        ).astype(np.float32)
 
-        # --- Dry patches (desert / drought areas) ---
-        n_dry = torch.randint(1, 5, (1,), generator=g).item()
-        for _ in range(n_dry):
-            cx = torch.randint(30, S - 30, (1,), generator=g).item()
-            cy = torch.randint(30, S - 30, (1,), generator=g).item()
-            sigma = torch.rand(1, generator=g).item() * 30 + 15
-            yy, xx = torch.meshgrid(
-                torch.arange(S, dtype=torch.float32),
-                torch.arange(S, dtype=torch.float32),
-                indexing="ij",
-            )
-            dry_zone = torch.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * sigma ** 2))
-            moisture = moisture * (1 - dry_zone * 0.7)
+        # Slope (terrain proxy)
+        slope = np.clip(
+            gaussian_filter(rng.randn(H, W), sigma=15) * 0.3 + 0.2,
+            0, 1,
+        ).astype(np.float32)
 
-        moisture = moisture.clamp(0, 1)
+        # Deforestation patches
+        deforestation_mask = np.zeros((H, W), dtype=np.float32)
+        n_patches = rng.randint(1, 5)
+        for _ in range(n_patches):
+            cx, cy = rng.randint(25, H - 25), rng.randint(25, W - 25)
+            rx, ry = rng.randint(5, 20), rng.randint(5, 20)
+            yy, xx = np.ogrid[-cx:H - cx, -cy:W - cy]
+            mask = (xx ** 2 / (ry ** 2 + 1e-8) + yy ** 2 / (rx ** 2 + 1e-8)) < 1
+            deforestation_mask[mask] = 1.0
 
-        # --- Vegetation water content: correlated with moisture ---
-        veg_water = moisture * 0.7 + _smooth_field(S, g, base_scale=16) * 0.3
-        veg_water = veg_water.clamp(0, 1)
+        cleared_forest = forest.copy()
+        cleared_forest[deforestation_mask > 0.5] = 0.0
 
-        # --- Soil temperature: inversely correlated with moisture ---
-        # Wet areas are cooler, dry areas are warmer
-        temp_base = 1 - moisture * 0.5 + _smooth_field(S, g, base_scale=48) * 0.2
-        temp_noise = torch.randn(S, S, generator=g) * 0.03
-        soil_temp = (temp_base + temp_noise).clamp(0, 1)
+        # Soil proxies derived from forest cover
+        moisture = cleared_forest * 0.8 + 0.2
+        veg_water = cleared_forest * 0.9
+        temp = 1.0 - cleared_forest * 0.6
 
-        # --- Freeze/thaw: cold regions ---
-        freeze_thaw = (soil_temp < 0.2).float()
+        # Stack: [5, H, W]
+        obs = np.stack([
+            moisture, veg_water, temp, slope, deforestation_mask,
+        ], axis=0)
 
-        observation = torch.stack([
-            moisture,
-            veg_water,
-            soil_temp,
-            freeze_thaw,
-        ], dim=0)  # [4, S, S]
+        # ── Counterfactual soil degradation target ──
+        # Soil degradation is highest on steep slopes near clearings
+        import scipy.ndimage as ndi
+        distance = ndi.distance_transform_edt(1 - deforestation_mask)
 
-        # --- Target: drought / degradation risk ---
-        # High risk = low moisture + high temperature + low vegetation
-        drought_risk = (1 - moisture) * 0.4 + soil_temp * 0.35 + (1 - veg_water) * 0.25
-        # Normalise
-        drought_risk = (drought_risk - drought_risk.min()) / (drought_risk.max() - drought_risk.min() + 1e-8)
-        target = drought_risk.unsqueeze(0)  # [1, S, S]
+        # Impact decays with distance (localised effect ~10px = ~300m)
+        proximity = np.exp(-distance / 10.0)
 
-        return observation, target
+        # Soil impact = proximity × slope × (1 - remaining forest cover)
+        forest_mask = (cleared_forest > 0.1).astype(np.float32)
+        soil_impact = proximity * slope * (1.0 - cleared_forest) * forest_mask
 
+        # Cleared areas themselves have maximum degradation
+        soil_impact[deforestation_mask > 0.5] = slope[deforestation_mask > 0.5]
 
-if __name__ == "__main__":
-    ds = SMAPSoilDataset(num_samples=4, seed=0)
-    obs, tgt = ds[0]
-    print(f"SMAP obs: {obs.shape}  min={obs.min():.3f}  max={obs.max():.3f}")
-    print(f"SMAP tgt: {tgt.shape}  mean_risk={tgt.mean():.3f}")
+        # Add stochastic noise
+        noise = gaussian_filter(rng.randn(H, W) * 0.05, sigma=3)
+        soil_impact = np.clip(soil_impact + noise, 0, None)
+
+        si_max = soil_impact.max()
+        if si_max > 1e-8:
+            soil_impact = soil_impact / si_max
+
+        soil_impact = gaussian_filter(soil_impact, sigma=2.0)
+        target = np.clip(soil_impact, 0, 1)[np.newaxis, :, :]
+
+        return (
+            torch.from_numpy(obs.astype(np.float32)),
+            torch.from_numpy(target.astype(np.float32)),
+        )

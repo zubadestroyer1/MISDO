@@ -1,143 +1,105 @@
 """
-Hansen Global Forest Change Dataset
-=====================================
-Generates synthetic data matching Hansen GFC structure (Landsat-derived).
+Hansen GFC Dataset — Counterfactual Cascade Deforestation (Synthetic)
+=======================================================================
+Generates synthetic forest data where the target is the CASCADE
+deforestation effect — how clearing one area causes additional
+forest loss in surrounding areas.
 
-Channels (5):
-    0: treecover2000 (percent canopy cover)     — [0, 1] (maps 0–100%)
-    1: lossyear (year of loss, 0=no loss, norm) — [0, 1] (maps 0–23)
-    2: gain (binary forest gain 2000–2012)      — {0, 1}
-    3: red band composite (Landsat B3/B4 norm)  — [0, 1]
-    4: NIR band composite (Landsat B4/B5 norm)  — [0, 1]
-
-Target: Binary forest-loss mask [1, 256, 256] where lossyear > 0 AND
-        treecover2000 > threshold.
+Input:  [B, 6, H, W]  — 5 forest features + deforestation mask
+Target: [B, 1, H, W]  — cascade deforestation impact delta [0, 1]
 """
 
 from __future__ import annotations
-
 from typing import Tuple
 
+import numpy as np
 import torch
-import torch.nn.functional as F
+from scipy.ndimage import binary_dilation, gaussian_filter
 from torch import Tensor
 from torch.utils.data import Dataset
 
 
-def _fractal_forest(S: int, g: torch.Generator, octaves: int = 5) -> Tensor:
-    """Generate fractal-like forest cover using multi-octave noise.
-
-    Produces spatially-correlated patterns mimicking real forest/non-forest
-    boundaries at ~30 m Landsat resolution.
-    """
-    result = torch.zeros(S, S)
-    for i in range(octaves):
-        freq = 2 ** i
-        weight = 1.0 / (freq + 1)
-        small = torch.rand(
-            max(S // (2 ** (octaves - i - 1)), 4),
-            max(S // (2 ** (octaves - i - 1)), 4),
-            generator=g,
-        )
-        upsampled = F.interpolate(
-            small.unsqueeze(0).unsqueeze(0),
-            size=(S, S),
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze()
-        result += upsampled * weight
-    # Normalise to [0, 1]
-    result = (result - result.min()) / (result.max() - result.min() + 1e-8)
-    return result
-
-
 class HansenGFCDataset(Dataset):
-    """Synthetic Hansen Global Forest Change dataset.
+    """Synthetic Hansen GFC dataset for counterfactual cascade training.
 
-    Uses fractal noise to generate realistic forest-cover patterns, then
-    simulates deforestation patches as rectangles and irregular clearings.
+    Generates landscapes with deforestation patches and computes
+    how much additional forest loss occurs near clearings due to
+    edge effects, fragmentation, and access-road pressure.
     """
-
-    NUM_CHANNELS: int = 5
 
     def __init__(
         self,
-        num_samples: int = 64,
-        spatial_size: int = 256,
+        num_samples: int = 256,
+        image_size: int = 256,
         seed: int = 42,
     ) -> None:
-        super().__init__()
         self.num_samples = num_samples
-        self.spatial_size = spatial_size
+        self.image_size = image_size
         self.seed = seed
 
     def __len__(self) -> int:
         return self.num_samples
 
     def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor]:
-        S = self.spatial_size
-        g = torch.Generator().manual_seed(self.seed + idx)
+        rng = np.random.RandomState(self.seed + idx)
+        H = W = self.image_size
 
-        # --- Treecover 2000: fractal forest ---
-        treecover = _fractal_forest(S, g)  # [S, S] in [0, 1]
+        # Treecover baseline
+        treecover = np.clip(
+            gaussian_filter(rng.randn(H, W), sigma=25) * 0.2 + 0.7,
+            0, 1,
+        ).astype(np.float32)
 
-        # --- Loss patches: random rectangular clearings ---
-        loss_mask = torch.zeros(S, S)
-        lossyear_map = torch.zeros(S, S)
-        n_clearings = torch.randint(3, 12, (1,), generator=g).item()
+        # Generate deforestation patches
+        deforestation_mask = np.zeros((H, W), dtype=np.float32)
+        n_patches = rng.randint(1, 6)
+        for _ in range(n_patches):
+            cx, cy = rng.randint(20, H - 20), rng.randint(20, W - 20)
+            rx, ry = rng.randint(8, 30), rng.randint(8, 30)
+            yy, xx = np.ogrid[-cx:H - cx, -cy:W - cy]
+            mask = (xx ** 2 / (ry ** 2 + 1e-8) + yy ** 2 / (rx ** 2 + 1e-8)) < 1
+            deforestation_mask[mask] = 1.0
 
-        for _ in range(n_clearings):
-            # Random position and size
-            rh = torch.randint(10, 40, (1,), generator=g).item()
-            rw = torch.randint(10, 40, (1,), generator=g).item()
-            ry = torch.randint(0, S - rh, (1,), generator=g).item()
-            rx = torch.randint(0, S - rw, (1,), generator=g).item()
-            year = torch.randint(1, 24, (1,), generator=g).item()  # 2001–2023
+        # Post-clearing forest
+        cleared = treecover.copy()
+        cleared[deforestation_mask > 0.5] = 0.0
 
-            # Only clear where there IS forest
-            patch = treecover[ry:ry+rh, rx:rx+rw]
-            forest_here = (patch > 0.3).float()
-            loss_mask[ry:ry+rh, rx:rx+rw] = torch.max(
-                loss_mask[ry:ry+rh, rx:rx+rw], forest_here
-            )
-            # Assign year only where forested
-            mask_update = (forest_here > 0) & (lossyear_map[ry:ry+rh, rx:rx+rw] == 0)
-            lossyear_map[ry:ry+rh, rx:rx+rw][mask_update] = year / 23.0
+        gain = (rng.rand(H, W) < 0.05).astype(np.float32)
+        ndvi_proxy = cleared * 0.8 + 0.2
+        canopy_change = np.zeros_like(treecover)
 
-        # --- Gain: some regrowth in older clearings ---
-        gain = torch.zeros(S, S)
-        early_loss = (lossyear_map > 0) & (lossyear_map < 0.5)
-        regrowth_prob = torch.rand(S, S, generator=g)
-        gain[early_loss & (regrowth_prob > 0.7)] = 1.0
+        # Stack: [6, H, W]
+        obs = np.stack([
+            cleared, np.zeros_like(treecover), gain,
+            ndvi_proxy, canopy_change, deforestation_mask,
+        ], axis=0)
 
-        # --- Landsat composites ---
-        # Red: higher in cleared areas, lower in forest
-        red = (1 - treecover * 0.7) * 0.6 + torch.randn(S, S, generator=g) * 0.05
-        red = red.clamp(0, 1)
-        # NIR: higher in forest (vegetation), lower in cleared
-        nir = treecover * 0.8 + torch.randn(S, S, generator=g) * 0.05
-        nir = nir.clamp(0, 1)
+        # ── Counterfactual cascade target ──
+        # Cascade deforestation: forest near clearings is more likely to be lost
+        # due to edge drying, fragmentation, access roads
+        forest_mask = (cleared > 0.3).astype(np.float32)
 
-        # Apply deforestation to composites
-        red = red + loss_mask * 0.2
-        nir = nir * (1 - loss_mask * 0.4)
+        # Impact decays with distance from clearing edge
+        import scipy.ndimage as ndi
+        distance = ndi.distance_transform_edt(1 - deforestation_mask)
+        cascade_prob = np.exp(-distance / 15.0)  # ~15px = ~450m decay
 
-        observation = torch.stack([
-            treecover,
-            lossyear_map,
-            gain,
-            red.clamp(0, 1),
-            nir.clamp(0, 1),
-        ], dim=0)  # [5, S, S]
+        # Higher cascade probability in thinner forest
+        vulnerability = (1.0 - cleared) * forest_mask
+        cascade_impact = cascade_prob * forest_mask * (0.3 + 0.7 * vulnerability)
 
-        # Target: binary loss mask where treecover was > 30%
-        target = (loss_mask * (treecover > 0.3).float()).unsqueeze(0)  # [1, S, S]
+        # Add stochastic variation
+        noise = gaussian_filter(rng.randn(H, W) * 0.05, sigma=3)
+        cascade_impact = np.clip(cascade_impact + noise, 0, None)
 
-        return observation, target
+        ci_max = cascade_impact.max()
+        if ci_max > 1e-8:
+            cascade_impact = cascade_impact / ci_max
 
+        cascade_impact = gaussian_filter(cascade_impact, sigma=2.0)
+        target = np.clip(cascade_impact, 0, 1)[np.newaxis, :, :]
 
-if __name__ == "__main__":
-    ds = HansenGFCDataset(num_samples=4, seed=0)
-    obs, tgt = ds[0]
-    print(f"Hansen obs: {obs.shape}  min={obs.min():.3f}  max={obs.max():.3f}")
-    print(f"Hansen tgt: {tgt.shape}  loss_pixels={tgt.sum().item():.0f}")
+        return (
+            torch.from_numpy(obs.astype(np.float32)),
+            torch.from_numpy(target.astype(np.float32)),
+        )

@@ -182,6 +182,86 @@ class SmoothMSELoss(nn.Module):
         return mse + self.grad_weight * grad_loss + self.corr_weight * corr_loss
 
 
+class EdgeWeightedMSELoss(nn.Module):
+    """MSE + gradient-matching with upweighting near deforestation edges.
+
+    For counterfactual impact prediction, the strongest signal is in
+    pixels immediately surrounding cleared areas.  This loss upweights
+    those pixels to focus learning on the high-impact zone.
+
+    Parameters
+    ----------
+    edge_weight : float
+        Multiplier for pixels within ``edge_radius`` of the deforestation
+        boundary (default 3.0 — 3× weight for edge pixels).
+    edge_radius : int
+        Number of dilation iterations to define the edge zone (default 5,
+        ~150 m at 30 m resolution).
+    grad_weight : float
+        Weight of the gradient-matching term (default 0.2).
+    base_weight : float
+        Weight for non-edge pixels (default 1.0).
+    """
+
+    def __init__(
+        self,
+        edge_weight: float = 3.0,
+        edge_radius: int = 5,
+        grad_weight: float = 0.2,
+        base_weight: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.edge_weight = edge_weight
+        self.edge_radius = edge_radius
+        self.grad_weight = grad_weight
+        self.base_weight = base_weight
+
+        # Dilation kernel for edge detection (3×3 max pool approximates dilation)
+        self._kernel_size = 2 * edge_radius + 1
+
+    def _compute_edge_mask(self, target: Tensor) -> Tensor:
+        """Compute a weight mask that upweights pixels near non-zero target regions.
+
+        Uses max-pooling as a GPU-friendly approximation of binary dilation.
+        """
+        # Detect regions with significant impact signal
+        has_signal = (target > 0.05).float()
+
+        # Dilate to find edge zone
+        dilated = F.max_pool2d(
+            has_signal,
+            kernel_size=self._kernel_size,
+            stride=1,
+            padding=self.edge_radius,
+        )
+
+        # Edge zone = dilated minus original signal area
+        edge_zone = (dilated - has_signal).clamp(0, 1)
+
+        # Weight map: base_weight everywhere + extra weight on edges + signal areas
+        weight_map = (
+            torch.ones_like(target) * self.base_weight
+            + edge_zone * (self.edge_weight - self.base_weight)
+            + has_signal * self.edge_weight
+        )
+
+        return weight_map
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        # Weighted MSE
+        weight_map = self._compute_edge_mask(target)
+        mse = (weight_map * (pred - target) ** 2).mean()
+
+        # Gradient matching
+        pred_dy = pred[:, :, 1:, :] - pred[:, :, :-1, :]
+        pred_dx = pred[:, :, :, 1:] - pred[:, :, :, :-1]
+        tgt_dy = target[:, :, 1:, :] - target[:, :, :-1, :]
+        tgt_dx = target[:, :, :, 1:] - target[:, :, :, :-1]
+        grad_loss = F.mse_loss(pred_dy, tgt_dy) + F.mse_loss(pred_dx, tgt_dx)
+
+        return mse + self.grad_weight * grad_loss
+
+
 class DeepSupervisionWrapper(nn.Module):
     """Wraps any base loss to incorporate UNet++ deep supervision outputs.
 
@@ -231,6 +311,61 @@ class DeepSupervisionWrapper(nn.Module):
         aux_mean = aux_total / len(deep_outputs)
         return main_loss + self.aux_weight * aux_mean
 
+class CounterfactualDeltaLoss(nn.Module):
+    """Loss for Siamese counterfactual training.
+
+    Combines EdgeWeightedMSELoss on the predicted delta with:
+    1. A monotonicity penalty — deforestation should NOT decrease risk,
+       so counterfactual output should be >= factual output.
+    2. Gradient matching on the delta itself.
+
+    Parameters
+    ----------
+    edge_weight : float
+        Upweight pixels near deforestation edges (default 3.0).
+    mono_weight : float
+        Weight of the monotonicity penalty (default 0.1).
+    """
+
+    def __init__(
+        self,
+        edge_weight: float = 3.0,
+        mono_weight: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.base_loss = EdgeWeightedMSELoss(edge_weight=edge_weight)
+        self.mono_weight = mono_weight
+
+    def forward(
+        self,
+        pred_delta: Tensor,
+        target_delta: Tensor,
+        out_factual: Tensor | None = None,
+        out_counterfactual: Tensor | None = None,
+    ) -> Tensor:
+        """Compute counterfactual loss.
+
+        Parameters
+        ----------
+        pred_delta : Tensor [B, 1, H, W]
+            Predicted impact delta (clamped cf - f).
+        target_delta : Tensor [B, 1, H, W]
+            Ground-truth impact delta.
+        out_factual : Tensor, optional
+            Raw factual output (for monotonicity penalty).
+        out_counterfactual : Tensor, optional
+            Raw counterfactual output (for monotonicity penalty).
+        """
+        loss = self.base_loss(pred_delta, target_delta)
+
+        # Monotonicity penalty: cf should >= f
+        if out_factual is not None and out_counterfactual is not None:
+            violation = F.relu(out_factual - out_counterfactual)
+            mono_penalty = violation.mean()
+            loss = loss + self.mono_weight * mono_penalty
+
+        return loss
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Loss registry for training scripts
@@ -241,6 +376,8 @@ LOSS_REGISTRY = {
     "dice_bce": DiceBCELoss,
     "gradient_mse": GradientMSELoss,
     "smooth_mse": SmoothMSELoss,
+    "edge_weighted_mse": EdgeWeightedMSELoss,
+    "counterfactual_delta": CounterfactualDeltaLoss,
 }
 
 

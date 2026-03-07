@@ -2,10 +2,12 @@
 MISDO Visualization Dashboard — Flask Backend
 ===============================================
 Serves model outputs as base64-encoded heatmap PNGs via a REST API.
+Models predict counterfactual IMPACT of deforestation on surrounding
+forest (not static risk maps).
 
 Endpoints:
     GET  /                  → Dashboard HTML
-    GET  /api/agent-masks   → 4 individual risk heatmaps
+    GET  /api/agent-masks   → 4 individual impact heatmaps
     POST /api/aggregate     → Fused harm mask with custom weights
     GET  /api/env-state     → Current RL environment state
     POST /api/env-step      → Execute one harvest step
@@ -56,14 +58,14 @@ _river_prox_tensor: Optional[Tensor] = None  # [1, 1, 256, 256]
 _flow_dir_tensor: Optional[Tensor] = None    # [1, 1, 256, 256] — D8 flow direction
 _forest_mask_tensor: Optional[Tensor] = None # [1, 1, 256, 256] — 1=forested, 0=non-forest
 
-# Head metadata — updated for real models
-HEAD_NAMES: List[str] = ["Fire Risk", "Forest Loss", "Water Pollution", "Soil Degradation"]
+# Head metadata — counterfactual impact models
+HEAD_NAMES: List[str] = ["Fire Impact", "Cascade Deforestation", "Erosion Impact", "Soil Degradation"]
 HEAD_CMAPS: List[str] = ["inferno", "YlOrRd", "YlGnBu", "Oranges"]
 HEAD_DESCRIPTIONS: List[str] = [
-    "VIIRS active fire detection risk",
-    "Hansen deforestation / forest loss risk",
-    "SRTM/HydroSHEDS erosion & runoff risk",
-    "SMAP soil degradation & drought risk",
+    "Fire risk increase in surrounding forest due to clearing",
+    "Cascade deforestation risk in surrounding forest due to clearing",
+    "Downstream erosion/pollution increase due to upstream clearing",
+    "Soil degradation increase in neighbouring areas due to clearing",
 ]
 
 
@@ -133,12 +135,21 @@ def _init_real_models(weights_dir: str) -> None:
     hydro_obs, _ = SRTMHydroDataset(1, 256, 0)[0]
     soil_obs, _ = SMAPSoilDataset(1, 256, 0)[0]
 
+    # Counterfactual inputs (with deforestation mask active)
     _domain_tensors = {
         "fire": fire_obs.unsqueeze(0).to(_device),
         "forest": forest_obs.unsqueeze(0).to(_device),
         "hydro": hydro_obs.unsqueeze(0).to(_device),
         "soil": soil_obs.unsqueeze(0).to(_device),
     }
+
+    # Factual inputs (deforestation mask channel zeroed out)
+    # Each domain's last channel is the deforestation mask
+    _domain_tensors_factual = {}
+    for name, tensor in _domain_tensors.items():
+        factual = tensor.clone()
+        factual[:, -1, :, :] = 0.0  # zero out deforestation mask channel
+        _domain_tensors_factual[name] = factual
 
     # Extract hard constraint data from real SRTM domain
     _extract_hard_constraints(_domain_tensors)
@@ -147,7 +158,9 @@ def _init_real_models(weights_dir: str) -> None:
     _perception = RealMISDOPerception(weights_dir=weights_dir).to(_device)
     _perception.eval()
     with torch.no_grad():
-        _agent_masks = _perception(_domain_tensors)
+        _agent_masks = _perception(
+            _domain_tensors_factual, _domain_tensors
+        )
 
     print("[INIT] Initializing Aggregator ...")
     _aggregator = ConditionedAggregator().to(_device)
@@ -176,7 +189,7 @@ def _init_real_models(weights_dir: str) -> None:
         flow_direction=flow_dir_np,
     )
     _env.reset(seed=42)
-    print("[INIT] Ready (REAL models).\n")
+    print("[INIT] Ready (REAL models — Siamese counterfactual).\n")
 
 
 def _init_legacy_models() -> None:
@@ -323,12 +336,12 @@ def get_agent_masks():
     assert _agent_masks is not None
     masks_np = _agent_masks.squeeze(0).cpu().numpy()  # [4, 256, 256]
 
-    # Colorbar labels per domain
+    # Colorbar labels per domain — impact deltas
     HEAD_CBAR_LABELS: List[str] = [
-        "Fire probability",
-        "Loss probability",
-        "Runoff risk",
-        "Degradation risk",
+        "Fire impact delta",
+        "Cascade risk delta",
+        "Erosion impact delta",
+        "Degradation impact delta",
     ]
 
     result: List[Dict[str, Any]] = []
@@ -495,13 +508,22 @@ def change_location():
                 "soil": soil_obs.unsqueeze(0).to(_device),
             }
 
+            # Factual inputs (deforestation mask zeroed)
+            _domain_tensors_factual = {}
+            for name, tensor in _domain_tensors.items():
+                factual = tensor.clone()
+                factual[:, -1, :, :] = 0.0
+                _domain_tensors_factual[name] = factual
+
             # Update hard constraints from new region's hydro data
             _extract_hard_constraints(_domain_tensors)
 
-            # Re-run models
+            # Re-run models (Siamese paired forward)
             _perception.eval()
             with torch.no_grad():
-                _agent_masks = _perception(_domain_tensors)
+                _agent_masks = _perception(
+                    _domain_tensors_factual, _domain_tensors
+                )
         else:
             # Legacy: just regenerate mock data
             from data import MockEODataset

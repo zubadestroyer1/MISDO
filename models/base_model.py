@@ -135,6 +135,66 @@ class DomainRiskNet(nn.Module):
         bottleneck, skips = self.encode(x)
         return self.decode(bottleneck, skips)
 
+    # ── Siamese Counterfactual Interface ──────────────────────────────
+
+    def forward_paired(
+        self, x_factual: Tensor, x_counterfactual: Tensor
+    ) -> Tensor:
+        """Paired forward pass for counterfactual impact prediction.
+
+        Runs the SAME encoder-decoder (shared weights) on two inputs:
+          • x_factual:        landscape WITHOUT the proposed clearing
+          • x_counterfactual: landscape WITH    the proposed clearing
+
+        Returns
+        -------
+        impact_delta : Tensor [B, 1, H, W]
+            Clamped difference (counterfactual - factual) in [0, 1].
+            Positive values indicate INCREASED risk due to clearing.
+        """
+        out_f = self.forward(x_factual)
+        out_cf = self.forward(x_counterfactual)
+        return torch.clamp(out_cf - out_f, 0.0, 1.0)
+
+    def forward_paired_deep(
+        self, x_factual: Tensor, x_counterfactual: Tensor
+    ) -> Tuple[Tensor, list]:
+        """Paired forward with deep supervision outputs for training.
+
+        Returns
+        -------
+        impact_delta : Tensor [B, 1, H, W]
+        deep_deltas  : list[Tensor]  — auxiliary impact deltas from
+                        intermediate UNet++ nodes (for deep supervision loss).
+        """
+        # Factual pass
+        b_f, s_f = self.encode(x_factual)
+        feat_f = {"s1": s_f["s1"], "s2": s_f["s2"], "s3": s_f["s3"], "s4": b_f}
+        result_f = self.decoder(feat_f, return_deep=True)
+        if isinstance(result_f, tuple):
+            out_f, deep_f = result_f
+        else:
+            out_f, deep_f = result_f, []
+
+        # Counterfactual pass (same weights)
+        b_cf, s_cf = self.encode(x_counterfactual)
+        feat_cf = {"s1": s_cf["s1"], "s2": s_cf["s2"], "s3": s_cf["s3"], "s4": b_cf}
+        result_cf = self.decoder(feat_cf, return_deep=True)
+        if isinstance(result_cf, tuple):
+            out_cf, deep_cf = result_cf
+        else:
+            out_cf, deep_cf = result_cf, []
+
+        # Main delta
+        delta = torch.clamp(out_cf - out_f, 0.0, 1.0)
+
+        # Deep supervision deltas
+        deep_deltas = []
+        for d_f, d_cf in zip(deep_f, deep_cf):
+            deep_deltas.append(torch.clamp(d_cf - d_f, 0.0, 1.0))
+
+        return delta, deep_deltas
+
 
 if __name__ == "__main__":
     # Quick test with a concrete subclass

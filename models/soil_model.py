@@ -1,17 +1,18 @@
 """
-SoilRiskNet — Soil Degradation Risk Model
-============================================
-ConvNeXt-V2 + UNet++ for continuous soil degradation risk estimation
-from satellite-derived soil moisture data.
+SoilImpactNet — Soil Degradation Impact Model
+================================================
+ConvNeXt-V2 + UNet++ for predicting how deforestation increases
+soil degradation in surrounding areas.
 
-Input  : [B, T, 4, 256, 256]  or  [B, 4, 256, 256]
-Output : [B, 1, 256, 256]  (soil degradation risk, sigmoid, [0, 1])
+Input  : [B, T, 5, 256, 256]  or  [B, 5, 256, 256]
+Output : [B, 1, 256, 256]  (soil degradation impact delta, [0, 1])
 
-Channels (4):
-    0: surface_soil_moisture (m³/m³ normalised)
-    1: vegetation_water_content (kg/m² normalised)
-    2: soil_temperature (K normalised)
-    3: freeze_thaw (binary flag)
+Channels (5):
+    0: moisture (forest * 0.8 + 0.2, soil moisture proxy)
+    1: veg_water (forest * 0.9, vegetation water content proxy)
+    2: temp (1 - forest * 0.6, soil temperature proxy)
+    3: slope (SRTM, normalised degrees)
+    4: deforestation_mask (binary: 1=cleared between T₁ and T₂)
 """
 
 from __future__ import annotations
@@ -21,8 +22,13 @@ from models.base_model import DomainRiskNet
 
 
 class SoilRiskNet(DomainRiskNet):
-    """ConvNeXt-V2 + UNet++ for continuous soil degradation risk."""
-    IN_CHANNELS: int = 4
+    """ConvNeXt-V2 + UNet++ for soil degradation impact prediction.
+
+    Predicts how much soil degradation (moisture loss, temperature
+    increase, topsoil erosion) occurs in surrounding areas when the
+    indicated tiles are cleared.
+    """
+    IN_CHANNELS: int = 5
 
 
 if __name__ == "__main__":
@@ -30,7 +36,7 @@ if __name__ == "__main__":
     params = sum(p.numel() for p in model.parameters())
     print(f"SoilRiskNet parameters: {params:,}")
 
-    x = torch.randn(1, 4, 256, 256)
+    x = torch.randn(1, 5, 256, 256)
     y = model(x)
     print(f"Single frame: {y.shape}  [{y.min():.3f}, {y.max():.3f}]")
 

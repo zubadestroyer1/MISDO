@@ -16,9 +16,9 @@ Phase 2: Fuse       — CrossDomainFusion exchanges bottleneck info
 Phase 3: Decode     — Each model's UNet++ decodes from enriched features
 ```
 
-**Input**: Dict of domain tensors `{"fire": [B,6,H,W], "forest": [B,5,H,W], "hydro": [B,5,H,W], "soil": [B,4,H,W]}`
+**Input**: Dict of domain tensors `{"fire": [B,7,H,W], "forest": [B,6,H,W], "hydro": [B,6,H,W], "soil": [B,5,H,W]}`
 
-**Output**: Stacked risk masks `[B, 4, 256, 256]`
+**Output**: Stacked impact masks `[B, 4, 256, 256]` — counterfactual impact deltas per domain
 
 ### CrossDomainFusion
 
@@ -44,7 +44,8 @@ Legacy shared ConvNeXt-Tiny backbone with 4 decoder heads for backward compatibi
 
 | Component | Parameters |
 |-----------|-----------|
-| 4× ConvNeXt-V2 + UNet++ models | ~136M total (~34M each) |
+| 4× ConvNeXt-V2 + UNet++ models | ~160M total (~40M each) |
 | CrossDomainFusion | ~40K |
 | TemporalAttention (per model) | ~4.5M each |
-| **Total** | ~136M |
+| DilatedContextModule (per model) | ~2.5M each |
+| **Total** | ~160M |

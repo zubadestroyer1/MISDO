@@ -52,6 +52,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from datasets.real_datasets import (
     RealFireDataset, RealHansenDataset, RealHydroDataset, RealSoilDataset,
+    compute_global_target_scale,
 )
 from models.fire_model import FireRiskNet
 from models.forest_model import ForestLossNet
@@ -307,18 +308,27 @@ def evaluate_model(
         return {"error": "no weights"}
 
     state = torch.load(weight_path, map_location=device, weights_only=True)
-    model.load_state_dict(state, strict=False)
+    model.load_state_dict(state, strict=True)
     model.eval()
 
     params = sum(p.numel() for p in model.parameters())
     print(f"  Parameters: {params:,}")
 
-    # Load validation dataset (2021-2023, held-out spatial tiles)
+    # Load validation dataset (2019-2021 events, held-out spatial tiles)
+    # Must match train_real_models.py validation config exactly
+    # temporal_split="validate" → _sample_window() else branch: events 2019–2021, impact by 2023
+    print(f"  Computing global target scale for {name}...")
+    target_scale = compute_global_target_scale(name, tiles_dir, split="train")
+
     DatasetCls = config["dataset_cls"]
     if config["temporal"]:
-        val_ds = DatasetCls(tiles_dir=tiles_dir, split="test", T=5, train_end_year=20)
+        val_ds = DatasetCls(tiles_dir=tiles_dir, split="test", T=5, train_end_year=23,
+                            year_start=17, temporal_split="validate",
+                            target_scale=target_scale)
     else:
-        val_ds = DatasetCls(tiles_dir=tiles_dir, split="test", train_end_year=20)
+        val_ds = DatasetCls(tiles_dir=tiles_dir, split="test", train_end_year=23,
+                            temporal_split="validate",
+                            target_scale=target_scale)
 
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False)
     print(f"  Validation samples: {len(val_ds)}")
@@ -330,11 +340,13 @@ def evaluate_model(
     n_samples = min(max_samples, len(val_ds))
 
     with torch.no_grad():
-        for i, (obs, target) in enumerate(val_loader):
+        for i, (obs_f, obs_cf, target) in enumerate(val_loader):
             if i >= n_samples:
                 break
-            obs = obs.to(device)
-            pred = model(obs)
+            obs_f = obs_f.to(device)
+            obs_cf = obs_cf.to(device)
+            # Use the same Siamese counterfactual interface as training
+            pred = model.forward_paired(obs_f, obs_cf)
 
             # Match spatial dimensions
             if pred.shape[2:] != target.shape[2:]:
