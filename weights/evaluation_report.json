@@ -1,0 +1,365 @@
+{
+  "fire": {
+    "model": "fire",
+    "params": 40606311,
+    "n_samples": 500,
+    "threshold": 0.5,
+    "pixel_metrics": {
+      "mse": 0.002297,
+      "mae": 0.014038,
+      "rmse": 0.047923,
+      "pearson": 0.5408,
+      "dice": "0.1137",
+      "iou": "0.0603",
+      "precision": 0.6365,
+      "recall": 0.0162,
+      "f1": 0.0315,
+      "auroc": 0.9871
+    },
+    "spatial_metrics": {
+      "ssim_mean": 0.6493,
+      "ssim_std": 0.2587,
+      "gradient_mse_mean": 0.000226
+    },
+    "calibration": {
+      "ece": 0.0039,
+      "reliability_curve": [
+        {
+          "bin_center": 0.05,
+          "predicted": 0.0066,
+          "observed": 0.0041,
+          "count": 31345741
+        },
+        {
+          "bin_center": 0.15,
+          "predicted": 0.1361,
+          "observed": 0.0991,
+          "count": 1147845
+        },
+        {
+          "bin_center": 0.25,
+          "predicted": 0.2378,
+          "observed": 0.2109,
+          "count": 211298
+        },
+        {
+          "bin_center": 0.35,
+          "predicted": 0.3382,
+          "observed": 0.31,
+          "count": 48297
+        },
+        {
+          "bin_center": 0.45,
+          "predicted": 0.4379,
+          "observed": 0.4024,
+          "count": 11501
+        },
+        {
+          "bin_center": 0.55,
+          "predicted": 0.5387,
+          "observed": 0.5252,
+          "count": 2858
+        },
+        {
+          "bin_center": 0.65,
+          "predicted": 0.6257,
+          "observed": 0.5611,
+          "count": 452
+        },
+        {
+          "bin_center": 0.75,
+          "predicted": 0.7117,
+          "observed": 0.8763,
+          "count": 8
+        }
+      ]
+    },
+    "distribution": {
+      "pred_mean": 0.0133,
+      "pred_std": 0.0386,
+      "pred_min": 0.0,
+      "pred_max": 0.7181,
+      "target_mean": 0.0094,
+      "target_std": 0.0559,
+      "target_min": 0.0,
+      "target_max": 0.9757,
+      "ks_statistic": 0.1603
+    },
+    "quality": {
+      "grade": "B \u2014 Good",
+      "score": 7,
+      "notes": [
+        "\u26a0 Low variance \u2014 predictions lack spatial diversity",
+        "\u2713 Strong spatial correlation with target",
+        "~ Low segmentation overlap",
+        "\u2713 Good structural similarity"
+      ]
+    }
+  },
+  "forest": {
+    "model": "forest",
+    "params": 40604775,
+    "n_samples": 500,
+    "threshold": 0.5,
+    "pixel_metrics": {
+      "mse": 0.009225,
+      "mae": 0.051508,
+      "rmse": 0.096046,
+      "pearson": 0.4328,
+      "dice": "0.1074",
+      "iou": "0.0568",
+      "precision": 0.5847,
+      "recall": 0.0368,
+      "f1": 0.0692,
+      "auroc": 0.9202
+    },
+    "spatial_metrics": {
+      "ssim_mean": 0.3149,
+      "ssim_std": 0.2347,
+      "gradient_mse_mean": 0.000504
+    },
+    "calibration": {
+      "ece": 0.0226,
+      "reliability_curve": [
+        {
+          "bin_center": 0.05,
+          "predicted": 0.0286,
+          "observed": 0.0122,
+          "count": 27972391
+        },
+        {
+          "bin_center": 0.15,
+          "predicted": 0.137,
+          "observed": 0.084,
+          "count": 3691210
+        },
+        {
+          "bin_center": 0.25,
+          "predicted": 0.2386,
+          "observed": 0.1645,
+          "count": 798298
+        },
+        {
+          "bin_center": 0.35,
+          "predicted": 0.3396,
+          "observed": 0.2436,
+          "count": 203532
+        },
+        {
+          "bin_center": 0.45,
+          "predicted": 0.4454,
+          "observed": 0.3257,
+          "count": 71480
+        },
+        {
+          "bin_center": 0.55,
+          "predicted": 0.535,
+          "observed": 0.4789,
+          "count": 23533
+        },
+        {
+          "bin_center": 0.65,
+          "predicted": 0.6354,
+          "observed": 0.5981,
+          "count": 6679
+        },
+        {
+          "bin_center": 0.75,
+          "predicted": 0.7346,
+          "observed": 0.3265,
+          "count": 839
+        },
+        {
+          "bin_center": 0.85,
+          "predicted": 0.8313,
+          "observed": 0.8196,
+          "count": 38
+        }
+      ]
+    },
+    "distribution": {
+      "pred_mean": 0.0493,
+      "pred_std": 0.063,
+      "pred_min": 0.0,
+      "pred_max": 0.8741,
+      "target_mean": 0.0266,
+      "target_std": 0.1013,
+      "target_min": 0.0,
+      "target_max": 0.9932,
+      "ks_statistic": 0.6331
+    },
+    "quality": {
+      "grade": "B \u2014 Good",
+      "score": 6,
+      "notes": [
+        "~ Moderate spatial correlation",
+        "~ Low segmentation overlap",
+        "~ Moderate structural similarity",
+        "\u26a0 Prediction distribution diverges from target"
+      ]
+    }
+  },
+  "hydro": {
+    "model": "hydro",
+    "params": 40604775,
+    "n_samples": 500,
+    "threshold": 0.5,
+    "pixel_metrics": {
+      "mse": 0.000387,
+      "mae": 0.005705,
+      "rmse": 0.019664,
+      "pearson": 0.9808,
+      "dice": "0.3847",
+      "iou": "0.2381",
+      "precision": 0.8735,
+      "recall": 0.8993,
+      "f1": 0.8862,
+      "auroc": 0.9994
+    },
+    "spatial_metrics": {
+      "ssim_mean": 0.9684,
+      "ssim_std": 0.0817,
+      "gradient_mse_mean": 9e-06
+    },
+    "calibration": {
+      "ece": 0.0009,
+      "reliability_curve": [
+        {
+          "bin_center": 0.05,
+          "predicted": 0.0059,
+          "observed": 0.0065,
+          "count": 30517070
+        },
+        {
+          "bin_center": 0.15,
+          "predicted": 0.142,
+          "observed": 0.1429,
+          "count": 970542
+        },
+        {
+          "bin_center": 0.25,
+          "predicted": 0.2449,
+          "observed": 0.2452,
+          "count": 429575
+        },
+        {
+          "bin_center": 0.35,
+          "predicted": 0.3459,
+          "observed": 0.3431,
+          "count": 245769
+        },
+        {
+          "bin_center": 0.45,
+          "predicted": 0.4473,
+          "observed": 0.4404,
+          "count": 159996
+        },
+        {
+          "bin_center": 0.55,
+          "predicted": 0.5479,
+          "observed": 0.5341,
+          "count": 120544
+        },
+        {
+          "bin_center": 0.65,
+          "predicted": 0.6482,
+          "observed": 0.6298,
+          "count": 95636
+        },
+        {
+          "bin_center": 0.75,
+          "predicted": 0.7495,
+          "observed": 0.7292,
+          "count": 81368
+        },
+        {
+          "bin_center": 0.85,
+          "predicted": 0.8558,
+          "observed": 0.8473,
+          "count": 108097
+        },
+        {
+          "bin_center": 0.95,
+          "predicted": 0.9193,
+          "observed": 0.9268,
+          "count": 39329
+        }
+      ]
+    },
+    "distribution": {
+      "pred_mean": 0.0274,
+      "pred_std": 0.0999,
+      "pred_min": 0.0,
+      "pred_max": 1.0,
+      "target_mean": 0.0278,
+      "target_std": 0.1005,
+      "target_min": 0.0,
+      "target_max": 1.0,
+      "ks_statistic": 0.1619
+    },
+    "quality": {
+      "grade": "A \u2014 Excellent",
+      "score": 9,
+      "notes": [
+        "\u2713 Strong spatial correlation with target",
+        "\u2713 Reasonable segmentation overlap",
+        "\u2713 Good structural similarity"
+      ]
+    }
+  },
+  "soil": {
+    "model": "soil",
+    "params": 40603239,
+    "n_samples": 500,
+    "threshold": 0.5,
+    "pixel_metrics": {
+      "mse": 0.003783,
+      "mae": 0.012912,
+      "rmse": 0.061508,
+      "pearson": 0.0,
+      "dice": "0.0",
+      "iou": "0.0",
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "auroc": 0.5491
+    },
+    "spatial_metrics": {
+      "ssim_mean": 0.606,
+      "ssim_std": 0.3979,
+      "gradient_mse_mean": 0.000159
+    },
+    "calibration": {
+      "ece": 0.0129,
+      "reliability_curve": [
+        {
+          "bin_center": 0.05,
+          "predicted": 0.0,
+          "observed": 0.0129,
+          "count": 32768000
+        }
+      ]
+    },
+    "distribution": {
+      "pred_mean": 0.0,
+      "pred_std": 0.0,
+      "pred_min": 0.0,
+      "pred_max": 0.0,
+      "target_mean": 0.0129,
+      "target_std": 0.0601,
+      "target_min": 0.0,
+      "target_max": 1.0,
+      "ks_statistic": 0.2961
+    },
+    "quality": {
+      "grade": "D \u2014 Needs improvement",
+      "score": 2,
+      "notes": [
+        "\u26a0 Mode collapse \u2014 predictions near-constant",
+        "\u2717 Weak spatial correlation",
+        "\u2717 Very low segmentation overlap",
+        "\u2713 Good structural similarity"
+      ]
+    }
+  }
+}

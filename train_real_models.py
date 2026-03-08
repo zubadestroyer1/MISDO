@@ -183,14 +183,14 @@ MODEL_CONFIGS = {
         "dataset_cls": RealHydroDataset,
         "loss_cls": CounterfactualDeltaLoss,
         "temporal": False,
-        "lr": 1e-3,
+        "lr": 3e-4,
     },
     "soil": {
         "model_cls": SoilRiskNet,
         "dataset_cls": RealSoilDataset,
         "loss_cls": CounterfactualDeltaLoss,
         "temporal": True,
-        "lr": 1e-3,
+        "lr": 3e-4,
     },
 }
 
@@ -203,7 +203,7 @@ def train_single_model(
     weights_dir: str,
     device: torch.device,
     accumulation_steps: int = 4,
-    use_amp: bool = False,
+    use_amp: bool | None = None,
     patience: int = 10,
 ) -> dict:
     """Train a single model on real data with production-grade features.
@@ -285,7 +285,10 @@ def train_single_model(
     augment = RandomFlipRotate()
 
     # AMP setup — device-aware autocast type
+    # Default to AMP on CUDA (A100 excels with mixed precision)
     amp_device_type = _get_amp_device_type(device)
+    if device.type == "cuda" and use_amp is None:
+        use_amp = True
     amp_enabled = use_amp and device.type != "cpu"
     scaler = torch.amp.GradScaler(enabled=amp_enabled)
 
@@ -309,6 +312,8 @@ def train_single_model(
         model.train()
         epoch_loss = 0.0
         n_batches = 0
+        nan_count = 0
+        max_nan_per_epoch = 20  # abort epoch if too many NaN batches
         optimizer.zero_grad()
 
         for batch_idx, (obs_f, obs_cf, target) in enumerate(train_loader):
@@ -344,6 +349,17 @@ def train_single_model(
 
                 # Scale loss by accumulation steps for correct gradient magnitude
                 loss = loss / accumulation_steps
+
+            # ── NaN guard: skip corrupted batches ──
+            if torch.isnan(loss) or torch.isinf(loss):
+                nan_count += 1
+                optimizer.zero_grad()  # discard accumulated gradients
+                if nan_count <= 3:
+                    print(f"  ⚠ NaN/Inf loss at epoch {epoch}, batch {batch_idx} — skipping")
+                if nan_count >= max_nan_per_epoch:
+                    print(f"  ✖ Too many NaN batches ({nan_count}) in epoch {epoch} — aborting epoch")
+                    break
+                continue
 
             # Backward pass with gradient scaling
             scaler.scale(loss).backward()
@@ -474,8 +490,10 @@ def main() -> None:
     parser.add_argument("--weights-dir", default="weights")
     parser.add_argument("--accumulation-steps", type=int, default=4,
                         help="Gradient accumulation steps (effective batch = batch_size × this)")
-    parser.add_argument("--amp", action="store_true",
-                        help="Enable automatic mixed precision")
+    parser.add_argument("--amp", action="store_true", default=None,
+                        help="Enable automatic mixed precision (default: auto-on for CUDA)")
+    parser.add_argument("--no-amp", dest="amp", action="store_false",
+                        help="Disable automatic mixed precision")
     parser.add_argument("--early-stop-patience", type=int, default=10,
                         help="Stop training if test loss hasn't improved for N epochs (default: 10)")
     args = parser.parse_args()
