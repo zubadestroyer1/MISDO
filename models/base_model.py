@@ -140,60 +140,70 @@ class DomainRiskNet(nn.Module):
     def forward_paired(
         self, x_factual: Tensor, x_counterfactual: Tensor
     ) -> Tensor:
-        """Paired forward pass for counterfactual impact prediction.
+        """Paired forward pass with joint fusion.
 
-        Runs the SAME encoder-decoder (shared weights) on two inputs:
-          • x_factual:        landscape WITHOUT the proposed clearing
-          • x_counterfactual: landscape WITH    the proposed clearing
+        Runs the encoder on both inputs, computes the difference
+        in the latent space, and decodes the difference directly.
 
         Returns
         -------
         impact_delta : Tensor [B, 1, H, W]
-            Clamped difference (counterfactual - factual) in [0, 1].
-            Positive values indicate INCREASED risk due to clearing.
+            Clamped impact delta in [0, 1].
         """
-        out_f = self.forward(x_factual)
-        out_cf = self.forward(x_counterfactual)
-        return torch.clamp(out_cf - out_f, 0.0, 1.0)
+        b_f, s_f = self.encode(x_factual)
+        b_cf, s_cf = self.encode(x_counterfactual)
+        
+        # Joint fusion by difference in latent space
+        b_diff = b_cf - b_f
+        s_diff = {k: s_cf[k] - s_f[k] for k in s_cf.keys()}
+        
+        delta = self.decode(b_diff, s_diff)
+        return torch.clamp(delta, 0.0, 1.0)
 
     def forward_paired_deep(
         self, x_factual: Tensor, x_counterfactual: Tensor
-    ) -> Tuple[Tensor, list]:
+    ) -> Tuple[Tensor, list, Tensor, Tensor]:
         """Paired forward with deep supervision outputs for training.
+        Uses latent joint fusion.
 
         Returns
         -------
         impact_delta : Tensor [B, 1, H, W]
-        deep_deltas  : list[Tensor]  — auxiliary impact deltas from
-                        intermediate UNet++ nodes (for deep supervision loss).
+            Clamped delta prediction.
+        deep_deltas  : list[Tensor]
+            Auxiliary deep supervision delta outputs.
+        out_factual : Tensor [B, 1, H, W]
+            Raw decoded factual output (for monotonicity penalty).
+        out_counterfactual : Tensor [B, 1, H, W]
+            Raw decoded counterfactual output (for monotonicity penalty).
         """
-        # Factual pass
         b_f, s_f = self.encode(x_factual)
-        feat_f = {"s1": s_f["s1"], "s2": s_f["s2"], "s3": s_f["s3"], "s4": b_f}
-        result_f = self.decoder(feat_f, return_deep=True)
-        if isinstance(result_f, tuple):
-            out_f, deep_f = result_f
-        else:
-            out_f, deep_f = result_f, []
-
-        # Counterfactual pass (same weights)
         b_cf, s_cf = self.encode(x_counterfactual)
-        feat_cf = {"s1": s_cf["s1"], "s2": s_cf["s2"], "s3": s_cf["s3"], "s4": b_cf}
-        result_cf = self.decoder(feat_cf, return_deep=True)
-        if isinstance(result_cf, tuple):
-            out_cf, deep_cf = result_cf
+
+        # Decode each branch independently to get raw outputs
+        # (needed for monotonicity penalty: cf should >= f)
+        out_f = self.decode(b_f, s_f)
+        out_cf = self.decode(b_cf, s_cf)
+
+        # Joint fusion for the delta prediction
+        b_diff = b_cf - b_f
+        feat_diff = {
+            "s1": s_cf["s1"] - s_f["s1"],
+            "s2": s_cf["s2"] - s_f["s2"],
+            "s3": s_cf["s3"] - s_f["s3"],
+            "s4": b_diff
+        }
+
+        result = self.decoder(feat_diff, return_deep=True)
+        if isinstance(result, tuple):
+            out_diff, deep_diff = result
         else:
-            out_cf, deep_cf = result_cf, []
+            out_diff, deep_diff = result, []
 
-        # Main delta
-        delta = torch.clamp(out_cf - out_f, 0.0, 1.0)
+        delta = torch.clamp(out_diff, 0.0, 1.0)
+        deep_deltas = [torch.clamp(d, 0.0, 1.0) for d in deep_diff]
 
-        # Deep supervision deltas
-        deep_deltas = []
-        for d_f, d_cf in zip(deep_f, deep_cf):
-            deep_deltas.append(torch.clamp(d_cf - d_f, 0.0, 1.0))
-
-        return delta, deep_deltas
+        return delta, deep_deltas, out_f, out_cf
 
 
 if __name__ == "__main__":

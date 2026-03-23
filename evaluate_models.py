@@ -315,20 +315,29 @@ def evaluate_model(
     print(f"  Parameters: {params:,}")
 
     # Load validation dataset (held-out spatial tiles, full year range)
-    # Matches train_real_models.py — spatial-only split, no temporal filtering
+    # MUST replicate train_real_models.py's 50/50 test-tile split:
+    #   First half  = checkpoint selection (seen during training as test set)
+    #   Second half = held-out validation (never used during training)
+    # We evaluate ONLY on the held-out second half.
     print(f"  Computing global target scale for {name}...")
     target_scale = compute_global_target_scale(name, tiles_dir, split="train")
 
     DatasetCls = config["dataset_cls"]
     if config["temporal"]:
-        val_ds = DatasetCls(tiles_dir=tiles_dir, split="test", T=5, train_end_year=23,
+        full_test_ds = DatasetCls(tiles_dir=tiles_dir, split="test", T=5, train_end_year=23,
                             target_scale=target_scale)
     else:
-        val_ds = DatasetCls(tiles_dir=tiles_dir, split="test", train_end_year=23,
+        full_test_ds = DatasetCls(tiles_dir=tiles_dir, split="test", train_end_year=23,
                             target_scale=target_scale)
 
+    # Replicate training's 50/50 split: evaluate only the held-out second half
+    n_test_total = len(full_test_ds)
+    n_test_half = n_test_total // 2
+    val_indices = list(range(n_test_half, n_test_total))
+    val_ds = torch.utils.data.Subset(full_test_ds, val_indices)
+
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False)
-    print(f"  Validation samples: {len(val_ds)}")
+    print(f"  Validation samples: {len(val_ds)} (held-out second half of {n_test_total} test tiles)")
     print(f"  Threshold: {threshold}")
 
     # Collect predictions and targets

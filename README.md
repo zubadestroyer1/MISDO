@@ -78,8 +78,11 @@ All models use a **ConvNeXt-V2 Base** encoder + **UNet++ decoder** + **DilatedCo
 
 - **Sliding temporal windows** — ~100 samples per chip (vs 1 with fixed windows)
 - **Control-pixel baseline subtraction** — isolates causal signal from background trends
-- **Single-patch augmentation** — 50% chance to show one clearing, bridging train/inference gap
-- **EdgeWeightedMSELoss** — 3× weight near deforestation edges where signal is strongest
+- **LR**: warmup → cosine annealing (3e-4 for all models)
+- **Loss**: CounterfactualDeltaLoss wrapping Edge-Weighted MSE (3× upweight near deforestation edges)
+- **Deep supervision**: UNet++ auxiliary losses (weight=0.3)
+- **Radiometric jitter**: mild brightness/contrast perturbation (p=0.5) to reduce overfitting to radiometric noise
+- **Early stopping**: Halts if test loss doesn't improve for 10 epochs
 
 See the [docs/](docs/) directory for detailed architecture documentation.
 
@@ -151,10 +154,17 @@ python train_models.py --model all --epochs 30
 # 1. Download curated data (30 tiles, ~1–3 hours)
 python datasets/download_real_data.py --mode curated --chips-per-tile 1000 --parallel 8
 
-# 2. Train all 4 models with AMP + gradient accumulation
+# 2. (Optional) Add MSI/SMAP augmentation for Hydro/Soil targets
+python datasets/download_msi_smap.py
+
+# 3. (Optional) Add VIIRS fire data via bulk archive (no rate limit)
+python datasets/download_real_data.py --mode curated --parallel 8 \
+    --viirs-archive /path/to/firms_csvs/
+
+# 4. Train all 4 models with AMP + gradient accumulation
 python train_real_models.py --model all --epochs 60 --amp --accumulation-steps 4
 
-# 3. Evaluate trained models
+# 5. Evaluate trained models
 python evaluate_models.py --tiles-dir datasets/real_tiles --weights-dir weights
 ```
 
@@ -184,7 +194,8 @@ python server.py
 │   └── fusion.py             # Cross-domain feature fusion
 ├── datasets/
 │   ├── real_datasets.py      # Real counterfactual datasets (sliding windows)
-│   ├── download_real_data.py # Satellite tile downloader (curated + global)
+│   ├── download_real_data.py # Satellite tile downloader (curated + global + VIIRS bulk)
+│   ├── download_msi_smap.py  # MSI/SMAP augmentation downloader
 │   ├── viirs_fire.py         # Synthetic fire impact data
 │   ├── hansen_gfc.py         # Synthetic cascade deforestation data
 │   ├── srtm_hydro.py         # Synthetic erosion impact data

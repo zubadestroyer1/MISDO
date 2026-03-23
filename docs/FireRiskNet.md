@@ -56,7 +56,7 @@ Fire impact delta: increase in fire activity in surrounding forest **caused by**
 
 - **Siamese counterfactual**: paired forward pass (factual vs counterfactual) with shared weights
 - **Spatial-only split**: 80% train tiles / 20% test+validate tiles, all years 1–23
-- **Data augmentation**: random flips + 90° rotations (applied identically to factual, counterfactual, and target)
+- **Data augmentation**: random flips + 90° rotations + RadiometricJitter (brightness/contrast p=0.5)
 - **Optimizer**: AdamW (lr=3e-4, weight_decay=0.01)
 - **Scheduler**: 10% linear warmup → cosine annealing
 - **Gradient accumulation**: 4× steps (effective batch = 64 on A100)

@@ -61,10 +61,10 @@ def main() -> None:
     t0 = time.time()
 
     datasets_info = {
-        "fire": {"class": VIIRSFireDataset, "channels": 6},
-        "forest": {"class": HansenGFCDataset, "channels": 5},
-        "hydro": {"class": SRTMHydroDataset, "channels": 5},
-        "soil": {"class": SMAPSoilDataset, "channels": 4},
+        "fire": {"class": VIIRSFireDataset, "channels": 7},
+        "forest": {"class": HansenGFCDataset, "channels": 6},
+        "hydro": {"class": SRTMHydroDataset, "channels": 6},
+        "soil": {"class": SMAPSoilDataset, "channels": 5},
     }
 
     domain_inputs = {}
@@ -142,10 +142,11 @@ def main() -> None:
     }
 
     # Extract hard-constraint data from the real SRTM hydro domain
-    # SRTM channels: 0=elevation, 1=slope, 2=aspect, 3=flow_acc, 4=flow_dir
-    hydro_tensor = domain_inputs["hydro"]  # [1, 5, 256, 256]
-    slope_tensor = hydro_tensor[:, 1:2, :, :]     # [1, 1, 256, 256]
-    river_tensor = hydro_tensor[:, 3:4, :, :]     # [1, 1, 256, 256]
+    # SRTMHydroDataset channels (6): 0=elevation, 1=slope, 2=aspect,
+    # 3=flow_acc, 4=cleared_forest, 5=deforestation_mask
+    hydro_tensor = domain_inputs["hydro"]  # [1, 6, 256, 256]
+    slope_tensor = hydro_tensor[:, 1:2, :, :]     # [1, 1, 256, 256]  (slope)
+    river_tensor = hydro_tensor[:, 3:4, :, :]     # [1, 1, 256, 256]  (flow_acc proxy)
 
     harm_masks = {}
     for config_name, weights in weight_configs.items():
@@ -206,7 +207,49 @@ def main() -> None:
     print(f"  Final forest: {obs[1].sum() / (SPATIAL * SPATIAL) * 100:.1f}%")
     print(f"  RL test time: {time.time() - t0:.2f}s")
 
-    # ─── Step 5: Summary ─────────────────────────────────────────────────
+    # ─── Step 5: Siamese Counterfactual Path ──────────────────────────────
+    # Exercises the actual forward_paired() used during real training,
+    # which the legacy single-branch test above does not cover.
+    print("\n[5/6] Testing Siamese counterfactual forward_paired path ...")
+    t0 = time.time()
+
+    siamese_results = {}
+    for name, ModelClass in model_classes.items():
+        model = ModelClass().to(device)
+        model.eval()
+
+        ch = model.IN_CHANNELS
+        # Synthetic factual / counterfactual pair
+        x_f = torch.rand(1, ch, 256, 256, device=device)
+        x_cf = torch.rand(1, ch, 256, 256, device=device)
+
+        with torch.no_grad():
+            delta = model.forward_paired(x_f, x_cf)
+
+        assert delta.shape == (1, 1, 256, 256), (
+            f"{name}: forward_paired shape wrong: {delta.shape}"
+        )
+        assert delta.min() >= 0.0, f"{name}: delta below 0"
+        assert delta.max() <= 1.0, f"{name}: delta above 1"
+
+        # Also test deep supervision variant
+        delta_deep, deep_list, out_f, out_cf = model.forward_paired_deep(x_f, x_cf)
+        assert isinstance(deep_list, list), f"{name}: deep_list not a list"
+        assert out_f.shape[1] == 1, f"{name}: out_f wrong channels"
+        assert out_cf.shape[1] == 1, f"{name}: out_cf wrong channels"
+
+        siamese_results[name] = {
+            "delta_range": [delta.min().item(), delta.max().item()],
+            "delta_mean": delta.mean().item(),
+            "deep_outputs": len(deep_list),
+        }
+        print(f"  {name:8s}: forward_paired ✓  "
+              f"delta=[{delta.min():.4f}, {delta.max():.4f}]  "
+              f"deep_outputs={len(deep_list)}")
+
+    print(f"  Siamese test time: {time.time() - t0:.2f}s")
+
+    # ─── Step 6: Summary ─────────────────────────────────────────────────
     from data import MockEODataset
     print(f"\n{'=' * 70}")
     print(f"  TEST RESULTS SUMMARY")
@@ -236,6 +279,11 @@ def main() -> None:
     print(f"    Total reward: {total_reward:.2f}")
     print(f"    Valid harvests: {valid_harvests} / {step + 1} attempts")
     print(f"    Forest remaining: {obs[1].sum() / (SPATIAL * SPATIAL) * 100:.1f}%")
+
+    print(f"\n  Siamese Counterfactual:")
+    for name, sr in siamese_results.items():
+        print(f"    {name:8s}: delta_range={sr['delta_range']}  "
+              f"deep_outputs={sr['deep_outputs']}")
 
     print(f"\n{'=' * 70}")
     print(f"  ✓ End-to-end pipeline test PASSED")

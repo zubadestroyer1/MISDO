@@ -148,6 +148,168 @@ FIRMS_API_URL = (
     "{key}/VIIRS_SNPP_SP/{west},{south},{east},{north}/10/{date}"
 )
 
+# FIRMS bulk archive download URLs (VIIRS SNPP C2, last 7 days + yearly archives)
+FIRMS_ARCHIVE_BASE = (
+    "https://firms.modaps.eosdis.nasa.gov/data/active_fire/"
+    "suomi-npp-viirs-c2/csv/"
+)
+
+
+class VIIRSArchive:
+    """Fast spatial lookup for VIIRS fire detections from bulk CSV files.
+
+    Loads FIRMS bulk archive CSVs into memory and builds a 1°×1° grid
+    index for O(1) bounding-box queries.  Each query returns a list of
+    fire dicts identical in format to ``_download_viirs_fires()``, so
+    the existing ``_rasterize_fires()`` works unchanged.
+
+    Parameters
+    ----------
+    csv_paths : list of str
+        Paths to FIRMS VIIRS SNPP CSV files (any mix of yearly/monthly).
+    """
+
+    # Columns we need (FIRMS CSV uses these header names)
+    _KEEP_COLS = [
+        "latitude", "longitude", "bright_ti4", "bright_ti5",
+        "frp", "confidence", "acq_date",
+    ]
+
+    def __init__(self, csv_paths: List[str]) -> None:
+        import csv as csv_mod
+
+        all_rows: List[Dict[str, str]] = []
+        for path in csv_paths:
+            with open(path, newline="") as f:
+                reader = csv_mod.DictReader(f)
+                for row in reader:
+                    # Keep only the columns we need
+                    filtered = {
+                        k: row.get(k, "") for k in self._KEEP_COLS
+                        if k in row
+                    }
+                    if "latitude" in filtered and "longitude" in filtered:
+                        all_rows.append(filtered)
+
+        print(f"  VIIRSArchive: loaded {len(all_rows):,} fire detections "
+              f"from {len(csv_paths)} file(s)")
+
+        # Build 1°×1° spatial grid index for fast bbox queries
+        self._grid: Dict[Tuple[int, int], List[Dict[str, str]]] = {}
+        for row in all_rows:
+            try:
+                lat = float(row["latitude"])
+                lon = float(row["longitude"])
+            except (ValueError, KeyError):
+                continue
+            key = (int(math.floor(lat)), int(math.floor(lon)))
+            self._grid.setdefault(key, []).append(row)
+
+        n_cells = len(self._grid)
+        print(f"  VIIRSArchive: indexed into {n_cells} grid cells")
+
+    def query(
+        self,
+        west: float,
+        south: float,
+        east: float,
+        north: float,
+    ) -> Optional[List[Dict[str, str]]]:
+        """Return fire detections within a bounding box.
+
+        Returns list of dicts (same format as ``_download_viirs_fires``),
+        or None if no fires found.
+        """
+        # Determine which 1° grid cells overlap the bbox
+        lat_min = int(math.floor(south))
+        lat_max = int(math.floor(north))
+        lon_min = int(math.floor(west))
+        lon_max = int(math.floor(east))
+
+        matches: List[Dict[str, str]] = []
+        for lat_cell in range(lat_min, lat_max + 1):
+            for lon_cell in range(lon_min, lon_max + 1):
+                cell_rows = self._grid.get((lat_cell, lon_cell))
+                if cell_rows is None:
+                    continue
+                for row in cell_rows:
+                    try:
+                        rlat = float(row["latitude"])
+                        rlon = float(row["longitude"])
+                    except (ValueError, KeyError):
+                        continue
+                    if south <= rlat <= north and west <= rlon <= east:
+                        matches.append(row)
+
+        return matches if matches else None
+
+
+def download_viirs_archive(
+    output_dir: str,
+    years: Optional[List[int]] = None,
+) -> List[str]:
+    """Download FIRMS VIIRS SNPP bulk archive CSVs.
+
+    Downloads yearly archive files to ``{output_dir}/.viirs_cache/``.
+    Skips files that already exist (cached).
+
+    Parameters
+    ----------
+    output_dir : str
+        Base output directory (e.g. ``datasets/real_tiles``).
+    years : list of int, optional
+        Years to download (default: 2018-2023).
+
+    Returns
+    -------
+    list of str
+        Paths to downloaded CSV files.
+    """
+    if years is None:
+        years = list(range(2018, 2024))
+
+    cache_dir = os.path.join(output_dir, ".viirs_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    csv_paths = []
+    for year in years:
+        filename = f"fire_nrt_SV-C2_{year}.csv"
+        local_path = os.path.join(cache_dir, filename)
+
+        if os.path.exists(local_path):
+            print(f"  VIIRS {year}: cached ({local_path})")
+            csv_paths.append(local_path)
+            continue
+
+        # Try multiple URL patterns (FIRMS uses different naming conventions)
+        urls_to_try = [
+            f"{FIRMS_ARCHIVE_BASE}fire_nrt_SV-C2_{year}.csv",
+            f"{FIRMS_ARCHIVE_BASE}fire_archive_SV-C2_{year}.csv",
+        ]
+
+        downloaded = False
+        for url in urls_to_try:
+            try:
+                print(f"  VIIRS {year}: downloading from {url}...")
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": "MISDO/1.0"}
+                )
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    data = resp.read()
+                with open(local_path, "wb") as f:
+                    f.write(data)
+                print(f"  VIIRS {year}: ✓ saved ({len(data) / 1e6:.1f} MB)")
+                csv_paths.append(local_path)
+                downloaded = True
+                break
+            except Exception as e:
+                continue
+
+        if not downloaded:
+            print(f"  VIIRS {year}: ✗ not available (will skip)")
+
+    return csv_paths
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Geo-referencing — convert Hansen pixel coords to lat/lon
@@ -305,19 +467,21 @@ def _derive_real_terrain(elevation: np.ndarray) -> Dict[str, np.ndarray]:
     Uses finite differences for gradient computation — same as
     standard GIS terrain analysis.
     """
-    # Normalise elevation to [0, 1] for model input
-    e_min, e_max = elevation.min(), elevation.max()
-    if e_max - e_min > 1e-6:
-        elev_norm = (elevation - e_min) / (e_max - e_min)
-    else:
-        elev_norm = np.zeros_like(elevation)
-
-    # Replace void values (-32768) with local minimum
+    # Replace void values (-32768) with local valid minimum BEFORE normalisation.
+    # If void pixels are included in min/max, the normalised elevation channel
+    # is corrupted (e.g., mapped to ~0 for all real values).
     void_mask = elevation < -1000
     if void_mask.any():
         valid_min = elevation[~void_mask].min() if (~void_mask).any() else 0
         elevation = elevation.copy()
         elevation[void_mask] = valid_min
+
+    # Normalise elevation to [0, 1] for model input (void-free)
+    e_min, e_max = elevation.min(), elevation.max()
+    if e_max - e_min > 1e-6:
+        elev_norm = (elevation - e_min) / (e_max - e_min)
+    else:
+        elev_norm = np.zeros_like(elevation)
 
     # Gradient computation (central differences)
     dy, dx = np.gradient(elevation)
@@ -760,9 +924,11 @@ def _download_single_chip(
     output_file: str,
     srtm_cache_dir: str,
     firms_key: Optional[str] = None,
+    viirs_archive: Optional['VIIRSArchive'] = None,
 ) -> Optional[Dict]:
     """Download a complete chip: Hansen GFC + SRTM elevation + VIIRS fire.
 
+    VIIRS priority: bulk archive → API (firms_key) → skip (proxy fallback).
     Returns metadata dict on success, None on failure.
     """
     import rasterio
@@ -793,8 +959,20 @@ def _download_single_chip(
             # Fallback to proxy terrain
             chip_data.update(_derive_proxy_terrain(chip_data["treecover2000"]))
 
-        # ── 3. VIIRS fire detections (if MAP_KEY provided) ──
-        if firms_key:
+        # ── 3. VIIRS fire detections ──
+        # Priority: bulk archive → per-chip API → skip
+        if viirs_archive is not None:
+            west, south, east, north = _chip_bounds(tile_code, px, py, chip_size)
+            buffer = 0.01  # ~1 km buffer (VIIRS 375m >> Hansen 30m)
+            fires = viirs_archive.query(
+                west - buffer, south - buffer, east + buffer, north + buffer
+            )
+            if fires:
+                chip_data.update(
+                    _rasterize_fires(fires, west, south, east, north, chip_size)
+                )
+                chip_data["has_real_viirs"] = np.array([1.0], dtype=np.float32)
+        elif firms_key:
             viirs_data = download_viirs_for_chip(
                 tile_code, px, py, chip_size, firms_key
             )
@@ -840,6 +1018,7 @@ def download_tile(
     max_forest_pct: float = 0.95,
     srtm_cache_dir: str = "",
     firms_key: Optional[str] = None,
+    viirs_archive: Optional['VIIRSArchive'] = None,
 ) -> List[Dict]:
     """Download chips from a single Hansen GFC tile with SRTM + VIIRS.
 
@@ -911,7 +1090,7 @@ def download_tile(
 
         result = _download_single_chip(
             tile_name, tile_code, px, py, chip_size, chip_file,
-            srtm_cache_dir, firms_key,
+            srtm_cache_dir, firms_key, viirs_archive,
         )
         if result:
             result["file"] = rel_path    # overwrite with portable relative path
@@ -1081,6 +1260,7 @@ def download_all(
     parallel: int = 1,
     firms_key: Optional[str] = None,
     train_ratio: float = 0.8,
+    viirs_archive_dir: Optional[str] = None,
 ) -> Dict:
     """Download chips from all tiles in tile_list.
 
@@ -1130,7 +1310,23 @@ def download_all(
     print(f"Downloading {len(tile_list)} tiles × {chips_per_tile} chips/tile")
     print(f"Target: ~{len(tile_list) * chips_per_tile:,} total chips")
     print(f"SRTM: ✓ Real elevation (cached to {srtm_cache_dir})")
-    print(f"VIIRS: {'✓ Real fire data (FIRMS API)' if firms_key else '✗ No MAP_KEY — fire data skipped'}\n")
+    # ── Load VIIRS bulk archive if provided ───────────────────────────
+    viirs_archive: Optional[VIIRSArchive] = None
+    if viirs_archive_dir is not None:
+        import glob
+        csv_files = sorted(glob.glob(os.path.join(viirs_archive_dir, "*.csv")))
+        if csv_files:
+            print(f"\nLoading VIIRS bulk archive from {viirs_archive_dir}...")
+            viirs_archive = VIIRSArchive(csv_files)
+        else:
+            print(f"\n⚠ No CSV files found in {viirs_archive_dir} — falling back")
+
+    viirs_source = (
+        "✓ Bulk archive (no rate limit)" if viirs_archive is not None
+        else ("✓ Real fire data (FIRMS API)" if firms_key
+              else "✗ No VIIRS source — fire data skipped")
+    )
+    print(f"VIIRS: {viirs_source}\n")
 
     manifest: Dict[str, Any] = {"train": [], "test": [], "metadata": {
         "n_tiles": len(tile_list),
@@ -1138,7 +1334,9 @@ def download_all(
         "n_test_tiles": n_test_t,
         "chips_per_tile": chips_per_tile,
         "has_real_srtm": True,
-        "has_real_viirs": bool(firms_key),
+        "has_real_viirs": viirs_archive is not None or bool(firms_key),
+        "viirs_source": ("bulk_archive" if viirs_archive is not None
+                         else ("api" if firms_key else "none")),
         "split_strategy": "tile-level (no within-tile splitting)",
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }}
@@ -1158,7 +1356,7 @@ def download_all(
         return split, download_tile(
             tile_name, ti, output_dir, split, chips_per_tile,
             256, 0.10, 0.95,
-            srtm_cache_dir, firms_key,
+            srtm_cache_dir, firms_key, viirs_archive,
         )
 
     if parallel > 1:
@@ -1247,12 +1445,25 @@ Examples:
              "Get one free at: https://firms.modaps.eosdis.nasa.gov/api/",
     )
     parser.add_argument(
+        "--viirs-archive", default=None, metavar="PATH",
+        help="Path to directory containing FIRMS bulk CSV files. "
+             "Bypasses per-chip API calls (no rate limit). "
+             "Download from: https://firms.modaps.eosdis.nasa.gov/download/",
+    )
+    parser.add_argument(
         "--discover-tiles", action="store_true",
         help="Only scan for forested tiles (no download). Saves cache file.",
     )
     parser.add_argument(
         "--list-tiles", action="store_true",
         help="List the 30 curated tiles and exit",
+    )
+    parser.add_argument(
+        "--max-total-chips", type=int, default=None,
+        help="Maximum total chips to download across all tiles. "
+             "If set, reduces chips_per_tile to stay within this limit. "
+             "Recommended: 30000 for curated (1-2 day training), "
+             "100000 for global (~1 week training on A100).",
     )
     args = parser.parse_args()
 
@@ -1324,17 +1535,42 @@ Examples:
         print("No forested tiles found. Try lowering --min-forest-pct.")
         return
 
+    # ── Enforce max-total-chips bound ──
+    chips_per_tile = args.chips_per_tile
+    if args.max_total_chips is not None:
+        max_per_tile = max(10, args.max_total_chips // len(tile_list))
+        if max_per_tile < chips_per_tile:
+            print(f"\n  ⚠ Reducing chips_per_tile from {chips_per_tile:,} to "
+                  f"{max_per_tile:,} to stay within --max-total-chips={args.max_total_chips:,}")
+            chips_per_tile = max_per_tile
+
+    total_chips = len(tile_list) * chips_per_tile
+    est_size_gb_low = total_chips * 0.5 / 1000  # ~0.5 MB per chip compressed
+    est_size_gb_high = total_chips * 2.0 / 1000  # ~2.0 MB with SRTM+VIIRS
+
     print(f"\n  Tiles: {len(tile_list)}")
-    print(f"  Chips per tile: {args.chips_per_tile:,}")
-    print(f"  Estimated total: ~{len(tile_list) * args.chips_per_tile:,} chips")
+    print(f"  Chips per tile: {chips_per_tile:,}")
+    print(f"  Estimated total: ~{total_chips:,} chips")
+    print(f"  ⚠ Estimated disk usage: {est_size_gb_low:.0f}–{est_size_gb_high:.0f} GB")
+    if total_chips > 100_000:
+        print(f"  ⚠ WARNING: Large download ({total_chips:,} chips). "
+              f"Use --max-total-chips to limit.")
     print(f"  Output: {output_dir}")
     print(f"  Parallel: {args.parallel}")
     print(f"  SRTM: ✓ Real elevation (30m, from AWS)")
-    print(f"  VIIRS: {'✓ Real fire (FIRMS API)' if firms_key else '✗ No key — pass --firms-key'}")
+
+    viirs_archive_dir = args.viirs_archive
+    viirs_label = (
+        f"✓ Bulk archive ({viirs_archive_dir})" if viirs_archive_dir
+        else ("✓ Real fire (FIRMS API)" if firms_key
+              else "✗ No key — pass --firms-key or --viirs-archive")
+    )
+    print(f"  VIIRS: {viirs_label}")
 
     t0 = time.time()
     manifest = download_all(
-        output_dir, tile_list, args.chips_per_tile, args.parallel, firms_key,
+        output_dir, tile_list, chips_per_tile, args.parallel, firms_key,
+        viirs_archive_dir=viirs_archive_dir,
     )
     elapsed = time.time() - t0
 

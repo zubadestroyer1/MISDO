@@ -41,7 +41,7 @@ Soil degradation impact delta: cumulative soil exposure WITH the clearing event 
 - **Siamese counterfactual**: paired forward pass (factual vs counterfactual) with shared weights
 - **Data source**: Physics proxy anchored to real Hansen deforestation events
 - **Spatial-only split**: 80% train tiles / 20% test+validate tiles, all years 1–23
-- **Data augmentation**: random flips + 90° rotations
+- **Data augmentation**: random flips + 90° rotations + RadiometricJitter (brightness/contrast p=0.5)
 - **Optimizer**: AdamW (lr=3e-4, weight_decay=0.01)
 - **Scheduler**: 10% linear warmup → cosine annealing
 - **Gradient accumulation**: 4× steps (effective batch = 64 on A100)

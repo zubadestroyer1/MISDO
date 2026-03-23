@@ -297,7 +297,7 @@ class ConvNeXtV2Backbone(nn.Module):
 # ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    for in_ch, name in [(6, "fire"), (5, "forest"), (5, "hydro"), (4, "soil")]:
+    for in_ch, name in [(7, "fire"), (6, "forest"), (6, "hydro"), (5, "soil")]:
         backbone = ConvNeXtV2Backbone(in_channels=in_ch)
         x = torch.randn(1, in_ch, 256, 256)
         features = backbone(x)

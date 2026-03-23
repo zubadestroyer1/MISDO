@@ -40,10 +40,11 @@ Label provenance (* = proxy, clients should be informed):
     Forest: Hansen GFC lossyear — cascade deforestation (✅ real observed).
     Fire:   VIIRS per-year rasters when available (✅ real observed),
             forest-loss proxy when VIIRS key unavailable (⚠ proxy *).
-    Hydro:  Physics-informed proxy: erosion delta downstream (⚠ proxy *).
-            No ground-truth erosion measurements are used.
-    Soil:   Physics-informed proxy: cumulative soil exposure delta (⚠ proxy *).
-            No ground-truth soil degradation measurements are used.
+    Hydro:  Real Sentinel-2 MSI NDSSI delta from Planetary Computer
+            (✅ real observed suspended-sediment change, via download_msi_smap.py).
+    Soil:   Physics-informed exposure delta weighted by real TerraClimate
+            soil moisture from Planetary Computer (⚠ hybrid — real weighting
+            on a derived target, no direct soil degradation observations).
 """
 
 from __future__ import annotations
@@ -62,6 +63,100 @@ from torch.utils.data import Dataset
 # ═══════════════════════════════════════════════════════════════════════════
 # Utilities
 # ═══════════════════════════════════════════════════════════════════════════
+
+# Keys that every chip MUST contain for any model to work.
+_REQUIRED_KEYS = ("treecover2000", "lossyear")
+
+# Additional keys checked per-domain (optional — uses fallback defaults if
+# absent, but warn if they contain NaN/Inf when present).
+_DOMAIN_OPTIONAL_KEYS = {
+    "forest": ("gain",),
+    "fire": ("srtm_slope", "srtm_elevation"),
+    "hydro": ("srtm_elevation", "srtm_slope", "srtm_aspect", "srtm_flow_acc"),
+    "soil": ("srtm_slope", "srtm_elevation"),
+}
+
+import logging as _logging
+
+_chip_logger = _logging.getLogger("misdo.chip_validation")
+
+_MAX_SKIP_WARNINGS = 50  # cap per-process to avoid log spam
+
+
+def validate_chip(
+    data: np.lib.npyio.NpzFile,
+    file_path: str,
+    domain: str | None = None,
+) -> tuple[bool, str]:
+    """Validate a loaded .npz chip for training quality.
+
+    Checks
+    ------
+    1. Required keys present (``treecover2000``, ``lossyear``).
+    2. No NaN or Inf in required arrays.
+    3. ``treecover2000`` is not all-zero (empty chips add noise).
+    4. Array shapes are 2-D and consistent across mandatory keys.
+    5. If *domain* is given, checks domain-specific optional keys for
+       NaN/Inf (warns but still passes, since fallback zeros are used).
+
+    Parameters
+    ----------
+    data : np.lib.npyio.NpzFile
+        The loaded ``.npz`` file.
+    file_path : str
+        Path to the chip file (for error messages).
+    domain : str | None
+        One of ``"forest"``, ``"fire"``, ``"hydro"``, ``"soil"``, or None.
+
+    Returns
+    -------
+    (is_valid, reason) : tuple[bool, str]
+        ``(True, "")`` if valid; ``(False, reason_string)`` otherwise.
+    """
+    basename = os.path.basename(file_path)
+
+    # ── 1. Required key presence ─────────────────────────────────────────
+    for key in _REQUIRED_KEYS:
+        if key not in data:
+            return False, f"{basename}: missing required key '{key}'"
+
+    # ── 2. Load and check required arrays ────────────────────────────────
+    tc = data["treecover2000"]
+    ly = data["lossyear"]
+
+    if tc.ndim != 2:
+        return False, f"{basename}: treecover2000 has {tc.ndim} dims, expected 2"
+    if ly.ndim != 2:
+        return False, f"{basename}: lossyear has {ly.ndim} dims, expected 2"
+    if tc.shape != ly.shape:
+        return (
+            False,
+            f"{basename}: shape mismatch treecover2000 {tc.shape} vs lossyear {ly.shape}",
+        )
+
+    if np.any(np.isnan(tc)) or np.any(np.isinf(tc)):
+        return False, f"{basename}: treecover2000 contains NaN/Inf"
+    if np.any(np.isnan(ly)) or np.any(np.isinf(ly)):
+        return False, f"{basename}: lossyear contains NaN/Inf"
+
+    # ── 3. All-zero treecover → useless for training ─────────────────────
+    if np.all(tc == 0):
+        return False, f"{basename}: treecover2000 is all-zero (no forest)"
+
+    # ── 4. Domain-specific optional-key sanity ───────────────────────────
+    if domain is not None and domain in _DOMAIN_OPTIONAL_KEYS:
+        for key in _DOMAIN_OPTIONAL_KEYS[domain]:
+            if key in data:
+                arr = data[key]
+                if np.any(np.isnan(arr)) or np.any(np.isinf(arr)):
+                    _chip_logger.debug(
+                        "%s: optional key '%s' contains NaN/Inf "
+                        "(will be replaced by nan_to_num fallback)",
+                        basename,
+                        key,
+                    )
+
+    return True, ""
 
 
 def compute_global_target_scale(
@@ -155,54 +250,57 @@ def compute_global_target_scale(
             )
 
         elif model_name == "hydro":
-            slope = np.nan_to_num(
-                data.get("srtm_slope", np.zeros_like(tc))
-            ).astype(np.float32)
-            elevation = np.nan_to_num(
-                data.get("srtm_elevation", np.zeros_like(tc))
-            ).astype(np.float32)
-            flow_acc = np.nan_to_num(
-                data.get("srtm_flow_acc", np.zeros_like(tc))
-            ).astype(np.float32)
+            # Skip chips without real MSI/SMAP data — their NDSSI delta
+            # is a zero-filled fallback that would deflate the scale.
+            has_real = data.get("has_real_msi_smap", None)
+            if has_real is not None and float(has_real.flat[0]) < 0.5:
+                continue
+            raw_target = data.get("msi_ndssi_delta", None)
+            if raw_target is None:
+                continue  # No real NDSSI data for this chip — skip
+            raw_target = raw_target.astype(np.float32)
+        elif model_name == "soil":
+            # Replicate the FULL RealSoilDataset target computation:
+            # exposure_delta + cascade_exposure*0.5 → control_baseline → SMAP weighting
+            slope = np.nan_to_num(data.get("srtm_slope", np.zeros_like(tc))).astype(np.float32)
 
-            dy, dx = np.gradient(elevation)
-            d2y = np.gradient(dy, axis=0)
-            d2x = np.gradient(dx, axis=1)
-            curvature = np.clip(-(d2y + d2x), 0, None)
-            curv_max = curvature.max()
-            curvature_norm = curvature / (curv_max + 1e-8)
-
-            forest_at_t1 = tc.copy()
-            forest_at_t1[(lossyear > 0) & (lossyear <= t1)] = 0.0
-            exposed_before = (forest_at_t1 < 0.3).astype(np.float32)
-            erosion_before = exposed_before * slope * (1.0 + curvature_norm)
-            exposed_after = (
-                (forest_at_t2 < 0.3) | (deforestation_mask > 0.5)
+            # Exposure delta (same as __getitem__)
+            exposed_before = (tc < 0.3).astype(np.float32)
+            clearing = (
+                (lossyear > t1) & (lossyear <= t2)
             ).astype(np.float32)
-            erosion_after = exposed_after * slope * (1.0 + curvature_norm)
-            erosion_delta = np.clip(erosion_after - erosion_before, 0, 1)
-            raw_target = gaussian_filter(
-                erosion_delta * (1.0 + flow_acc * 3.0), sigma=5.0
+            forest_at_t2_soil = tc.copy()
+            forest_at_t2_soil[(lossyear > 0) & (lossyear <= t2)] = 0.0
+            cleared_tc = forest_at_t2_soil.copy()
+            cleared_tc[clearing > 0.5] = 0.0
+            exposed_after = (cleared_tc < 0.3).astype(np.float32)
+            exposure_delta = np.clip(
+                (exposed_after - exposed_before) * slope, 0, None
             )
 
-        elif model_name == "soil":
-            slope = np.nan_to_num(
-                data.get("srtm_slope", np.zeros_like(tc))
+            # Cascade forest loss (matches __getitem__ lines 944-948)
+            additional_loss_soil = (
+                (lossyear > t2) & (lossyear <= t_impact)
             ).astype(np.float32)
-            cumulative_with = np.zeros_like(tc)
-            cumulative_without = np.zeros_like(tc)
-            for y in range(t1 + 1, t_impact + 1):
-                years_since = float(t_impact - y + 1)
-                deforested_with = (
-                    (lossyear > 0) & (lossyear <= y)
-                ).astype(np.float32)
-                cumulative_with += deforested_with * slope * years_since
-                deforested_without = (
-                    (lossyear > 0) & (lossyear <= y)
-                    & ~((lossyear > t1) & (lossyear <= t2))
-                ).astype(np.float32)
-                cumulative_without += deforested_without * slope * years_since
-            raw_target = np.clip(cumulative_with - cumulative_without, 0, None)
+            cascade_exposure = additional_loss_soil * slope
+
+            # Combined raw degradation (matches __getitem__ line 951)
+            raw_degradation = exposure_delta + cascade_exposure * 0.5
+
+            # Control-baseline subtraction (matches __getitem__ lines 952-954)
+            forest_mask_soil = (forest_at_t2_soil > 0.3).astype(np.float32)
+            raw_target = _control_baseline(
+                raw_degradation, clearing, forest_mask_soil, near_radius=10,
+            )
+
+            # SMAP soil moisture weighting (matches __getitem__ lines 958-965)
+            smap = data.get("smap_soil_moisture", None)
+            if smap is not None:
+                smap = smap.astype(np.float32)
+                smap_max = smap.max()
+                if smap_max > 1e-8:
+                    smap_norm = smap / smap_max
+                    raw_target = raw_target * (0.5 + 0.5 * smap_norm)
         else:
             raise ValueError(f"Unknown model: {model_name}")
 
@@ -306,7 +404,7 @@ def _control_baseline(
 
 
 def _sample_window(
-    split: str,
+    _split: str,
     rng: np.random.RandomState,
     train_end: int = 23,
     min_window: int = 2,
@@ -319,6 +417,19 @@ def _sample_window(
     geographic tiles for train vs test).  The model learns a
     time-invariant physical relationship (clearing → impact), so
     temporal holdout is unnecessary.
+
+    Parameters
+    ----------
+    _split : str
+        Dataset split name (e.g. "train", "test"). Intentionally unused —
+        retained for API compatibility with callers. All splits sample
+        identically because leakage is prevented at the tile level.
+    rng : np.random.RandomState
+        Random state for reproducibility.
+    train_end : int
+        Maximum year (inclusive) to sample from (default 23 = year 2023).
+    min_window, max_window : int
+        Min/max width of the observation→impact gap.
 
     Returns
     -------
@@ -391,9 +502,24 @@ class RealHansenDataset(Dataset):
         return len(self.entries)
 
     def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor, Tensor]:
-        entry = self.entries[idx]
-        file_path = _resolve_chip_path(self.tiles_dir, entry["file"])
-        data = np.load(file_path)
+        # ── Load with validation & retry ────────────────────────────────
+        for _attempt in range(5):
+            entry = self.entries[idx]
+            file_path = _resolve_chip_path(self.tiles_dir, entry["file"])
+            try:
+                data = np.load(file_path)
+            except Exception as exc:
+                _chip_logger.warning("Corrupted chip %s: %s — skipping", file_path, exc)
+                idx = np.random.randint(len(self.entries))
+                continue
+            valid, reason = validate_chip(data, file_path, domain="forest")
+            if not valid:
+                _chip_logger.warning("Skipping chip: %s", reason)
+                idx = np.random.randint(len(self.entries))
+                continue
+            break
+        else:
+            raise RuntimeError("Failed to load a valid chip after 5 attempts")
         rng = np.random.RandomState(idx + self._epoch_seed)
 
         treecover = data["treecover2000"].astype(np.float32)
@@ -539,9 +665,24 @@ class RealFireDataset(Dataset):
         return len(self.entries)
 
     def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor, Tensor]:
-        entry = self.entries[idx]
-        file_path = _resolve_chip_path(self.tiles_dir, entry["file"])
-        data = np.load(file_path)
+        # ── Load with validation & retry ────────────────────────────────
+        for _attempt in range(5):
+            entry = self.entries[idx]
+            file_path = _resolve_chip_path(self.tiles_dir, entry["file"])
+            try:
+                data = np.load(file_path)
+            except Exception as exc:
+                _chip_logger.warning("Corrupted chip %s: %s — skipping", file_path, exc)
+                idx = np.random.randint(len(self.entries))
+                continue
+            valid, reason = validate_chip(data, file_path, domain="fire")
+            if not valid:
+                _chip_logger.warning("Skipping chip: %s", reason)
+                idx = np.random.randint(len(self.entries))
+                continue
+            break
+        else:
+            raise RuntimeError("Failed to load a valid chip after 5 attempts")
         rng = np.random.RandomState(idx + self._epoch_seed)
 
         tc = data["treecover2000"].astype(np.float32) / 100.0
@@ -701,12 +842,32 @@ class RealFireDataset(Dataset):
 # Hydro Impact Dataset
 # ═══════════════════════════════════════════════════════════════════════════
 
-class RealHydroDataset(Dataset):
-    """Hydrological impact dataset — EROSION DELTA DOWNSTREAM.
+# ── Hydro temporal constants ──────────────────────────────────────
+# download_msi_smap.py fetches Sentinel-2 imagery for two fixed periods:
+#   baseline: 2016-01-01 → 2017-01-01  (Hansen year 16)
+#   impact:   2020-01-01 → 2021-01-01  (Hansen year 20)
+# The input deforestation mask MUST match these years so the model
+# learns the correct causal relationship (clearing → sediment change).
+_HYDRO_T1: int = 16   # baseline year  (2016)
+_HYDRO_T2: int = 20   # impact year    (2020)
 
-    Physics-informed proxy target: erosion risk INCREASE on downstream
-    cells after upstream deforestation, compared to the baseline
-    (pre-clearing) condition.
+
+class RealHydroDataset(Dataset):
+    """Hydrological impact dataset — WATER POLLUTION DELTA DOWNSTREAM.
+
+    Uses real Sentinel-2 MSI NDSSI (Normalised Difference Suspended
+    Sediment Index) delta as the target, downloaded by
+    ``download_msi_smap.py`` via Microsoft Planetary Computer.
+
+    Target: observed increase in suspended sediment concentration
+    downstream of deforestation, measured as NDSSI_before - NDSSI_after
+    (positive = more sediment after clearing).
+
+    **Temporal alignment:** The target is fixed to 2016→2020 (Hansen
+    years 16→20) because ``download_msi_smap.py`` fetches Sentinel-2
+    imagery for those exact periods.  The deforestation mask is
+    therefore locked to ``(lossyear > 16) & (lossyear <= 20)`` to
+    maintain causal alignment between input and target.
 
     Input:  [6, 256, 256]  — terrain + forest + deforestation mask
     Target: [1, 256, 256]  — water pollution impact delta [0, 1]
@@ -740,9 +901,24 @@ class RealHydroDataset(Dataset):
         return len(self.entries)
 
     def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor, Tensor]:
-        entry = self.entries[idx]
-        file_path = _resolve_chip_path(self.tiles_dir, entry["file"])
-        data = np.load(file_path)
+        # ── Load with validation & retry ────────────────────────────────
+        for _attempt in range(5):
+            entry = self.entries[idx]
+            file_path = _resolve_chip_path(self.tiles_dir, entry["file"])
+            try:
+                data = np.load(file_path)
+            except Exception as exc:
+                _chip_logger.warning("Corrupted chip %s: %s — skipping", file_path, exc)
+                idx = np.random.randint(len(self.entries))
+                continue
+            valid, reason = validate_chip(data, file_path, domain="hydro")
+            if not valid:
+                _chip_logger.warning("Skipping chip: %s", reason)
+                idx = np.random.randint(len(self.entries))
+                continue
+            break
+        else:
+            raise RuntimeError("Failed to load a valid chip after 5 attempts")
         rng = np.random.RandomState(idx + self._epoch_seed)
 
         tc = data["treecover2000"].astype(np.float32) / 100.0
@@ -753,10 +929,10 @@ class RealHydroDataset(Dataset):
         aspect = np.nan_to_num(data.get("srtm_aspect", np.zeros_like(tc))).astype(np.float32)
         flow_acc = np.nan_to_num(data.get("srtm_flow_acc", np.zeros_like(tc))).astype(np.float32)
 
-        # ── Sample temporal window ──
-        t1, t2, t_impact = _sample_window(
-            self.temporal_split, rng, self.train_end_year,
-        )
+        # ── Fixed temporal window (must match download_msi_smap.py) ──
+        # The NDSSI target is baked to 2016→2020 at download time, so
+        # the deforestation mask must use the same years.
+        t1, t2 = _HYDRO_T1, _HYDRO_T2
 
         # ── Deforestation mask ──
         deforestation_mask = (
@@ -782,28 +958,9 @@ class RealHydroDataset(Dataset):
             elevation, slope, aspect, flow_acc, forest, deforestation_mask,
         ], axis=0)
 
-        # ── Counterfactual erosion target ──
-        dy, dx = np.gradient(elevation)
-        d2y = np.gradient(dy, axis=0)
-        d2x = np.gradient(dx, axis=1)
-        curvature = np.clip(-(d2y + d2x), 0, None)
-        curv_max = curvature.max()
-        curvature_norm = curvature / (curv_max + 1e-8)
-
-        forest_at_t1 = tc.copy()
-        forest_at_t1[(lossyear > 0) & (lossyear <= t1)] = 0.0
-
-        exposed_before = (forest_at_t1 < 0.3).astype(np.float32)
-        erosion_before = exposed_before * slope * (1.0 + curvature_norm)
-
-        exposed_after = ((forest < 0.3) | (deforestation_mask > 0.5)).astype(np.float32)
-        erosion_after = exposed_after * slope * (1.0 + curvature_norm)
-
-        erosion_delta = np.clip(erosion_after - erosion_before, 0, 1)
-
-        pollution_delta = gaussian_filter(
-            erosion_delta * (1.0 + flow_acc * 3.0), sigma=5.0
-        )
+        # ── Real Sentinel-2 NDSSI Target ──
+        # Fetch actual water pollution / suspended sediment delta
+        pollution_delta = data.get("msi_ndssi_delta", np.zeros_like(tc)).astype(np.float32)
 
         if self.target_scale is not None:
             pollution_delta = pollution_delta / (self.target_scale + 1e-8)
@@ -812,6 +969,9 @@ class RealHydroDataset(Dataset):
             if p_max > 1e-8:
                 pollution_delta = pollution_delta / p_max
 
+        # Gaussian smoothing (consistent with forest/fire/soil targets)
+        # Prevents overfitting to pixel-level satellite noise in NDSSI.
+        pollution_delta = gaussian_filter(pollution_delta, sigma=2.0)
         pollution_delta = np.clip(pollution_delta, 0, 1)
         target = pollution_delta[np.newaxis, :, :]
 
@@ -827,12 +987,18 @@ class RealHydroDataset(Dataset):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class RealSoilDataset(Dataset):
-    """Soil degradation impact dataset — EXPOSURE DELTA.
+    """Soil degradation impact dataset — COUNTERFACTUAL EXPOSURE DELTA.
 
-    Physics-informed proxy target: soil exposure INCREASE in
-    neighbouring cells after clearing, with temporal compounding
-    (longer exposure = worse degradation).  Compared to pre-clearing
-    baseline to isolate the clearing's contribution.
+    Target: soil exposure INCREASE in neighbouring cells caused by
+    the clearing, compared to pre-clearing baseline.  When real SMAP
+    soil moisture data is available (from ``download_msi_smap.py``),
+    it weights the exposure delta to produce a physically-informed
+    degradation signal (exposed + high baseline moisture = worse
+    degradation risk).
+
+    The target depends on the deforestation mask and temporal window,
+    ensuring the model learns a causal relationship between clearing
+    location and soil degradation.
 
     Input:  [T, 5, 256, 256]  — soil state + deforestation mask
     Target: [1, 256, 256]     — soil degradation impact delta [0, 1]
@@ -870,9 +1036,24 @@ class RealSoilDataset(Dataset):
         return len(self.entries)
 
     def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor, Tensor]:
-        entry = self.entries[idx]
-        file_path = _resolve_chip_path(self.tiles_dir, entry["file"])
-        data = np.load(file_path)
+        # ── Load with validation & retry ────────────────────────────────
+        for _attempt in range(5):
+            entry = self.entries[idx]
+            file_path = _resolve_chip_path(self.tiles_dir, entry["file"])
+            try:
+                data = np.load(file_path)
+            except Exception as exc:
+                _chip_logger.warning("Corrupted chip %s: %s — skipping", file_path, exc)
+                idx = np.random.randint(len(self.entries))
+                continue
+            valid, reason = validate_chip(data, file_path, domain="soil")
+            if not valid:
+                _chip_logger.warning("Skipping chip: %s", reason)
+                idx = np.random.randint(len(self.entries))
+                continue
+            break
+        else:
+            raise RuntimeError("Failed to load a valid chip after 5 attempts")
         rng = np.random.RandomState(idx + self._epoch_seed)
 
         tc = data["treecover2000"].astype(np.float32) / 100.0
@@ -925,38 +1106,57 @@ class RealSoilDataset(Dataset):
             ], axis=0)
             frames_counterfactual.append(frame_cf)
 
-        # ── Counterfactual soil degradation target ──
-        forest_at_t1 = tc.copy()
-        forest_at_t1[(lossyear > 0) & (lossyear <= t1)] = 0.0
+        # ── Counterfactual Soil Degradation Target ──
+        # Compute soil exposure BEFORE vs AFTER clearing to get causal delta
+        forest_at_t2 = tc.copy()
+        forest_at_t2[(lossyear > 0) & (lossyear <= t2)] = 0.0
+        forest_mask = (forest_at_t2 > 0.3).astype(np.float32)
 
-        cumulative_with = np.zeros_like(tc)
-        cumulative_without = np.zeros_like(tc)
+        # Soil exposure BEFORE clearing (areas already degraded)
+        exposed_before = (tc < 0.3).astype(np.float32)
+        exposure_before = exposed_before * slope
 
-        for y in range(t1 + 1, t_impact + 1):
-            years_since = float(t_impact - y + 1)
+        # Soil exposure AFTER clearing (new areas exposed by the clearing)
+        cleared_tc = forest_at_t2.copy()
+        cleared_tc[deforestation_mask > 0.5] = 0.0
+        exposed_after = (cleared_tc < 0.3).astype(np.float32)
+        exposure_after = exposed_after * slope
 
-            deforested_with = (
-                (lossyear > 0) & (lossyear <= y)
-            ).astype(np.float32)
-            cumulative_with += deforested_with * slope * years_since
+        # Delta = new exposure caused by clearing
+        exposure_delta = np.clip(exposure_after - exposure_before, 0, None)
 
-            deforested_without = (
-                (lossyear > 0) & (lossyear <= y)
-                & ~((lossyear > t1) & (lossyear <= t2))
-            ).astype(np.float32)
-            cumulative_without += deforested_without * slope * years_since
+        # Also account for forest loss between t2 and t_impact (cascade soil effect)
+        additional_loss = (
+            (lossyear > t2) & (lossyear <= t_impact)
+        ).astype(np.float32)
+        cascade_exposure = additional_loss * slope
 
-        soil_delta = np.clip(cumulative_with - cumulative_without, 0, None)
+        # Combined: exposure delta + cascade, with control-baseline subtraction
+        raw_degradation = exposure_delta + cascade_exposure * 0.5
+        soil_impact = _control_baseline(
+            raw_degradation, deforestation_mask, forest_mask, near_radius=10,
+        )
+
+        # If real SMAP soil moisture is available, use it to weight the target:
+        # areas with high baseline moisture that lose forest lose MORE moisture
+        smap = data.get("smap_soil_moisture", None)
+        if smap is not None:
+            smap = smap.astype(np.float32)
+            smap_max = smap.max()
+            if smap_max > 1e-8:
+                smap_norm = smap / smap_max
+                # Weight by baseline moisture: high moisture → worse degradation
+                soil_impact = soil_impact * (0.5 + 0.5 * smap_norm)
 
         if self.target_scale is not None:
-            soil_delta = soil_delta / (self.target_scale + 1e-8)
+            soil_impact = soil_impact / (self.target_scale + 1e-8)
         else:
-            sd_max = soil_delta.max()
-            if sd_max > 1e-8:
-                soil_delta = soil_delta / sd_max
+            si_max = soil_impact.max()
+            if si_max > 1e-8:
+                soil_impact = soil_impact / si_max
 
-        degradation = gaussian_filter(soil_delta, sigma=2.0)
-        degradation = np.clip(degradation, 0, 1)
+        soil_impact = gaussian_filter(soil_impact, sigma=2.0)
+        degradation = np.clip(soil_impact, 0, 1)
         target = degradation[np.newaxis, :, :]
 
         obs_f = np.stack(frames_factual, axis=0)

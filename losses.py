@@ -289,13 +289,16 @@ class DeepSupervisionWrapper(nn.Module):
         pred: Tensor,
         target: Tensor,
         deep_outputs: list[Tensor] | None = None,
+        **kwargs,
     ) -> Tensor:
-        main_loss = self.base_loss(pred, target)
+        main_loss = self.base_loss(pred, target, **kwargs)
 
         if deep_outputs is None or len(deep_outputs) == 0:
             return main_loss
 
         # Auxiliary losses — resize target to match each auxiliary output
+        # Note: kwargs (out_factual etc.) are NOT passed to auxiliaries —
+        # monotonicity is only enforced on the main output.
         aux_total = torch.zeros(1, device=pred.device, dtype=pred.dtype)
         for aux_pred in deep_outputs:
             if aux_pred.shape != target.shape:
@@ -314,26 +317,29 @@ class DeepSupervisionWrapper(nn.Module):
 class CounterfactualDeltaLoss(nn.Module):
     """Loss for Siamese counterfactual training.
 
-    Combines EdgeWeightedMSELoss on the predicted delta with:
+    Combines EdgeWeightedMSELoss (or a custom base_loss) on the predicted delta with:
     1. A monotonicity penalty — deforestation should NOT decrease risk,
        so counterfactual output should be >= factual output.
     2. Gradient matching on the delta itself.
 
     Parameters
     ----------
+    base_loss : nn.Module | None
+        Custom base loss. If None, defaults to EdgeWeightedMSELoss.
     edge_weight : float
-        Upweight pixels near deforestation edges (default 3.0).
+        Upweight pixels near deforestation edges if using default MSE (default 3.0).
     mono_weight : float
         Weight of the monotonicity penalty (default 0.1).
     """
 
     def __init__(
         self,
+        base_loss: nn.Module | None = None,
         edge_weight: float = 3.0,
         mono_weight: float = 0.1,
     ) -> None:
         super().__init__()
-        self.base_loss = EdgeWeightedMSELoss(edge_weight=edge_weight)
+        self.base_loss = base_loss if base_loss is not None else EdgeWeightedMSELoss(edge_weight=edge_weight)
         self.mono_weight = mono_weight
 
     def forward(

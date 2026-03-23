@@ -4,8 +4,14 @@ HydroImpactNet — Water-Pollution Impact Model
 ConvNeXt-V2 + UNet++ for predicting how deforestation increases
 downstream water pollution / erosion risk.
 
-Input  : [B, T, 6, 256, 256]  or  [B, 6, 256, 256]
+Input  : [B, 6, 256, 256]  (non-temporal, single-frame)
 Output : [B, 1, 256, 256]  (water-pollution impact delta, [0, 1])
+
+Temporal mode is DISABLED for hydro because the Sentinel-2 MSI
+NDSSI target is baked to a fixed 2016→2020 window at download
+time (download_msi_smap.py), making temporal sliding unnecessary.
+The encoder still supports temporal inputs architecturally, but
+the training config sets ``temporal=False``.
 
 Channels (6):
     0: elevation (DEM, normalised)

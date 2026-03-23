@@ -32,18 +32,18 @@ The `CounterfactualDeltaLoss` has a built-in penalty ensuring counterfactual out
 
 **Limitation:** Coarse resolution means chip-level scalar targets, not pixel-level maps. Could combine with DEM-derived susceptibility for spatial detail.
 
-### 4. Add Data Quality Checks
-No validation at load time for all-zero chips, NaN/Inf values, missing keys, or corrupted `.npz` files. Any of these silently corrupt training.
+### 4. ~~Add Data Quality Checks~~ ✔ (Fixed)
+~~No validation at load time for all-zero chips, NaN/Inf values, missing keys, or corrupted `.npz` files. Any of these silently corrupt training.~~ Implemented via `validate_chip()` in `real_datasets.py` — validates every chip at `__getitem__` time with retry on failure.
 
 ---
 
 ## 🟡 Moderate Priority (Accuracy / Robustness)
 
-### 5. Global Random Seeds
-Add `torch.manual_seed(42)` and `np.random.seed(42)` at training entry for reproducible runs.
+### 5. ~~Global Random Seeds~~ ✔ (Fixed)
+~~Add `torch.manual_seed(42)` and `np.random.seed(42)` at training entry for reproducible runs.~~ Implemented in `train_real_models.py`.
 
-### 6. Fix Gradient Accumulation Edge Case
-Final mini-batch of each epoch has incorrect gradient scaling when fewer than `accumulation_steps` batches remain.
+### 6. ~~Fix Gradient Accumulation Edge Case~~ ✔ (Fixed)
+~~Final mini-batch of each epoch has incorrect gradient scaling when fewer than `accumulation_steps` batches remain.~~ Fixed in `train_real_models.py`.
 
 ### 7. VIIRS Proxy Distribution Shift
 Events years 1–11 (2001–2011) use crude proxy fire channels because VIIRS launched in 2012. Consider:
@@ -70,8 +70,8 @@ Manual AUROC uses left-endpoint summation — systematically underestimates. Rep
 ### 12. SRTM Void Infill
 Void values (-32768) are replaced with `valid_min`. Local spatial interpolation would be more accurate for mountainous tiles.
 
-### 13. FIRMS API Coverage
-VIIRS download queries day 1 of each month (10-day window), missing ~2/3 of annual fire detections. Expand to query all months fully.
+### 13. ~~FIRMS API Coverage~~ ✔ (Addressed)
+~~VIIRS download queries day 1 of each month (10-day window), missing ~2/3 of annual fire detections.~~ **Resolved** by switching to FIRMS bulk archive CSV downloads via `--viirs-archive`. The bulk CSVs contain the complete year of fire detections with no gaps.
 
 ### 14. Input Normalisation Consistency
 Some channels use global scales (slope: degrees/45°), others per-chip (VIIRS fire count). Standardise to global scales computed from dataset statistics.

@@ -254,7 +254,6 @@ class SpatialTemporalCV:
         )
 
 
-@torch.no_grad()
 def run_cross_validation(
     model_class: type,
     dataset: Dataset,
@@ -268,8 +267,9 @@ def run_cross_validation(
 ) -> Dict[str, Any]:
     """Run spatially-blocked cross-validation on a model.
 
-    Trains the model from scratch on each fold and collects
-    per-fold metrics.
+    Supports both legacy datasets returning ``(obs, target)`` and
+    Siamese counterfactual datasets returning ``(obs_f, obs_cf, target)``.
+    The format is auto-detected from the first training batch.
 
     Parameters
     ----------
@@ -323,12 +323,32 @@ def run_cross_validation(
         model = model_class().to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
+        # Auto-detect dataset format from first sample:
+        #   2-tuple → legacy (obs, target)
+        #   3-tuple → Siamese (obs_f, obs_cf, target)
+        sample = dataset[train_idx[0]] if len(train_idx) > 0 else dataset[0]
+        siamese = len(sample) == 3
+
         # Train
         for epoch in range(epochs):
             model.train()
-            for obs, target in train_loader:
-                obs, target = obs.to(device), target.to(device)
-                pred = model(obs)
+            for batch in train_loader:
+                if siamese:
+                    obs_f, obs_cf, target = batch
+                    obs_f = obs_f.to(device)
+                    obs_cf = obs_cf.to(device)
+                    target = target.to(device)
+                    pred = model.forward_paired(obs_f, obs_cf)
+                else:
+                    obs, target = batch
+                    obs, target = obs.to(device), target.to(device)
+                    pred = model(obs)
+                # Match spatial dimensions if needed
+                if pred.shape[2:] != target.shape[2:]:
+                    target = F.interpolate(
+                        target, size=pred.shape[2:],
+                        mode="bilinear", align_corners=False,
+                    )
                 loss = F.mse_loss(pred, target)
                 optimizer.zero_grad()
                 loss.backward()
@@ -340,9 +360,22 @@ def run_cross_validation(
         total_mae = 0.0
         n = 0
         with torch.no_grad():
-            for obs, target in val_loader:
-                obs, target = obs.to(device), target.to(device)
-                pred = model(obs)
+            for batch in val_loader:
+                if siamese:
+                    obs_f, obs_cf, target = batch
+                    obs_f = obs_f.to(device)
+                    obs_cf = obs_cf.to(device)
+                    target = target.to(device)
+                    pred = model.forward_paired(obs_f, obs_cf)
+                else:
+                    obs, target = batch
+                    obs, target = obs.to(device), target.to(device)
+                    pred = model(obs)
+                if pred.shape[2:] != target.shape[2:]:
+                    target = F.interpolate(
+                        target, size=pred.shape[2:],
+                        mode="bilinear", align_corners=False,
+                    )
                 total_mse += F.mse_loss(pred, target).item()
                 total_mae += (pred - target).abs().mean().item()
                 n += 1

@@ -80,16 +80,41 @@ python datasets/download_real_data.py \
 
 ### Optional: Add VIIRS Fire Data
 
-Real fire detections improve the fire model significantly. Get a free MAP_KEY from [NASA FIRMS](https://firms.modaps.eosdis.nasa.gov/api/area/):
+Real fire detections improve the fire model significantly.
+
+**Option 1 — Bulk archive (recommended, no rate limit):**
+
+Download VIIRS SNPP CSV archives from [NASA FIRMS Download](https://firms.modaps.eosdis.nasa.gov/download/) and place them in a directory:
 
 ```bash
-export FIRMS_MAP_KEY="your_key_here"
+python datasets/download_real_data.py \
+    --mode curated \
+    --chips-per-tile 1000 \
+    --parallel 8 \
+    --viirs-archive /path/to/firms_csvs/
+```
 
+**Option 2 — Per-chip API (slow, rate-limited):**
+
+Get a free MAP_KEY from [NASA FIRMS](https://firms.modaps.eosdis.nasa.gov/api/area/):
+
+```bash
 python datasets/download_real_data.py \
     --mode curated \
     --chips-per-tile 1000 \
     --parallel 8 \
     --firms-key your_key_here
+```
+
+> [!WARNING]
+> The per-chip API is heavily rate-limited (~10 req/min on free tier). For 30K chips this would take weeks. Use the bulk archive instead.
+
+### Optional: Add MSI/SMAP Augmentation
+
+Downloads Sentinel-2 MSI and NASA SMAP data to enrich Hydro and Soil model targets:
+
+```bash
+python datasets/download_msi_smap.py
 ```
 
 ### Optional: Tropics-Only Download
@@ -108,6 +133,7 @@ python datasets/download_real_data.py \
 | `datasets/real_tiles/` | All `.npz` chip files |
 | `datasets/real_tiles/manifest.json` | Train/test split index (80/20 spatial) |
 | `datasets/real_tiles/.srtm_cache/` | Cached SRTM elevation tiles |
+| `datasets/real_tiles/.viirs_cache/` | Cached VIIRS bulk archive CSVs (if downloaded) |
 
 ---
 
@@ -172,10 +198,11 @@ python train_real_models.py \
 - Trains all 4 models sequentially: Fire → Forest → Hydro → Soil
 - **Batch size**: 16 on CUDA (effective = 16 × 4 = 64)
 - **AMP**: Mixed precision for 2× speed
-- **LR**: warmup → cosine annealing (3e-4 for fire/forest, 1e-3 for hydro/soil)
-- **Loss**: Edge-Weighted MSE (upweights deforestation edge pixels)
+- **LR**: warmup → cosine annealing (3e-4 for all models)
+- **Loss**: CounterfactualDeltaLoss wrapping Edge-Weighted MSE (upweights deforestation edge pixels)
 - **Deep supervision**: UNet++ auxiliary losses (weight=0.3)
-- **Early stopping**: Halts if test loss doesn't improve for 10 epochs
+- **Radiometric jitter**: mild brightness/contrast perturbation (p=0.5) on inputs
+- **Early stopping**: Halts if test loss doesn’t improve for 10 epochs
 
 ### 4.4 Train a Single Model
 
@@ -254,6 +281,12 @@ pip install -r requirements.txt
 # 2. Download curated data
 python datasets/download_real_data.py --mode curated --chips-per-tile 1000 --parallel 8
 
+# 2b. (Optional) Add VIIRS fire data via bulk archive
+python datasets/download_real_data.py --mode curated --parallel 8 --viirs-archive /path/to/firms_csvs/
+
+# 2c. (Optional) Add MSI/SMAP augmentation
+python datasets/download_msi_smap.py
+
 # 3. Train all 4 counterfactual impact models
 python train_real_models.py --model all --epochs 60 --amp --accumulation-steps 4
 
@@ -275,6 +308,8 @@ tar -czf misdo_weights_$(date +%Y%m%d).tar.gz weights/
 | `--early-stop-patience` | `10` | Epochs without improvement before stopping |
 | `--tiles-dir` | `datasets/real_tiles` | Path to downloaded data |
 | `--weights-dir` | `weights` | Path to save model checkpoints |
+| `--viirs-archive` | — | Path to FIRMS bulk CSV directory (bypasses API rate limit) |
+| `--firms-key` | — | NASA FIRMS MAP_KEY for per-chip API (slow, rate-limited) |
 
 ### Troubleshooting
 
@@ -284,5 +319,5 @@ tar -czf misdo_weights_$(date +%Y%m%d).tar.gz weights/
 | `CUDA out of memory` | Reduce `--accumulation-steps` to 2 |
 | `treecover2000 missing` | Hansen GCS server may be throttling — retry with fewer `--parallel` |
 | `SRTM download failures` | Some polar tiles lack SRTM — these fall back to proxy terrain |
-| `No VIIRS fire data` | Get a free FIRMS MAP_KEY from NASA |
+| `No VIIRS fire data` | Use `--viirs-archive` with bulk CSV files, or pass `--firms-key` |
 | `Training loss not decreasing` | Verify data with `python test_real_pipeline.py` |
