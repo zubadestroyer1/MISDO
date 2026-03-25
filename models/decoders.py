@@ -8,8 +8,7 @@ feature maps.
 Includes a DilatedContextModule (ASPP-style) at the bottleneck to
 capture long-range spatial impact propagation (1–5 km at 30 m res).
 
-Output uses ReLU + clamp(0, 1) instead of sigmoid for sharper
-gradients on near-zero impact deltas.
+Output uses sigmoid activation for smooth gradients on impact deltas.
 
 Reference:
     Zhou et al., "UNet++: A Nested U-Net Architecture for Medical
@@ -254,7 +253,7 @@ class UNetPPDecoder(nn.Module):
         # ── Output heads ──
         self.head = nn.Conv2d(d // 4, 1, kernel_size=1)
 
-        # Deep supervision heads (predict at X_{0,1}, X_{0,2}, X_{0,3})
+        # Deep supervision heads (predict at X_{0,1}, X_{0,2}, X_{1,2})
         if deep_supervision:
             self.ds_heads = nn.ModuleList([
                 nn.Sequential(
@@ -332,15 +331,16 @@ class UNetPPDecoder(nn.Module):
 
         # ── Final upsample (H/4 → H) and prediction ──
         out = self.final_up(x03)
-        # ReLU + clamp for sharper gradients on near-zero impact deltas
-        # (sigmoid plateaus make it hard to distinguish small differences)
-        out = torch.clamp(F.relu(self.head(out)), 0.0, 1.0)
+        # Sigmoid activation for output — provides smooth gradients
+        # everywhere, unlike ReLU+clamp which kills gradients for ~50%
+        # of outputs when inputs are near-zero (common in Siamese delta).
+        out = torch.sigmoid(self.head(out))
 
         if return_deep and self.deep_supervision:
             deep = [
-                torch.clamp(F.relu(self.ds_heads[0](x01)), 0.0, 1.0),
-                torch.clamp(F.relu(self.ds_heads[1](x02)), 0.0, 1.0),
-                torch.clamp(F.relu(self.ds_heads[2](x03)), 0.0, 1.0),
+                torch.sigmoid(self.ds_heads[0](x01)),
+                torch.sigmoid(self.ds_heads[1](x02)),
+                torch.sigmoid(self.ds_heads[2](x12)),
             ]
             return out, deep
 

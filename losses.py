@@ -225,7 +225,9 @@ class EdgeWeightedMSELoss(nn.Module):
         Uses max-pooling as a GPU-friendly approximation of binary dilation.
         """
         # Detect regions with significant impact signal
-        has_signal = (target > 0.05).float()
+        # Threshold lowered to 0.01 to capture weak targets after
+        # global target_scale normalisation (many targets < 0.05).
+        has_signal = (target > 0.01).float()
 
         # Dilate to find edge zone
         dilated = F.max_pool2d(

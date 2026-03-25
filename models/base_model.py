@@ -19,6 +19,7 @@ from typing import Dict, Any, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 from models.backbone import ConvNeXtV2Backbone
@@ -140,10 +141,13 @@ class DomainRiskNet(nn.Module):
     def forward_paired(
         self, x_factual: Tensor, x_counterfactual: Tensor
     ) -> Tensor:
-        """Paired forward pass with joint fusion.
+        """Paired forward pass — independent branch decoding.
 
-        Runs the encoder on both inputs, computes the difference
-        in the latent space, and decodes the difference directly.
+        Runs the encoder+decoder on both inputs independently, then
+        computes the impact delta as (cf - f) in decoded output space.
+        This ensures the decoder always processes normal feature
+        statistics (all-positive from GELU), not zero-centered
+        differences that would be killed by ReLU.
 
         Returns
         -------
@@ -152,26 +156,31 @@ class DomainRiskNet(nn.Module):
         """
         b_f, s_f = self.encode(x_factual)
         b_cf, s_cf = self.encode(x_counterfactual)
-        
-        # Joint fusion by difference in latent space
-        b_diff = b_cf - b_f
-        s_diff = {k: s_cf[k] - s_f[k] for k in s_cf.keys()}
-        
-        delta = self.decode(b_diff, s_diff)
-        return torch.clamp(delta, 0.0, 1.0)
+
+        # Decode each branch with normal feature statistics
+        out_f = self.decode(b_f, s_f)
+        out_cf = self.decode(b_cf, s_cf)
+
+        # Delta = counterfactual - factual (deforestation increases risk)
+        delta = torch.clamp(out_cf - out_f, 0.0, 1.0)
+        return delta
 
     def forward_paired_deep(
         self, x_factual: Tensor, x_counterfactual: Tensor
     ) -> Tuple[Tensor, list, Tensor, Tensor]:
         """Paired forward with deep supervision outputs for training.
-        Uses latent joint fusion.
+
+        Decodes each branch independently and computes delta in output
+        space.  Deep supervision outputs come from the counterfactual
+        branch (the branch with deforestation signal) to provide
+        auxiliary gradient signal at multiple decoder depths.
 
         Returns
         -------
         impact_delta : Tensor [B, 1, H, W]
             Clamped delta prediction.
-        deep_deltas  : list[Tensor]
-            Auxiliary deep supervision delta outputs.
+        deep_outputs : list[Tensor]
+            Auxiliary deep supervision outputs from counterfactual branch.
         out_factual : Tensor [B, 1, H, W]
             Raw decoded factual output (for monotonicity penalty).
         out_counterfactual : Tensor [B, 1, H, W]
@@ -180,28 +189,37 @@ class DomainRiskNet(nn.Module):
         b_f, s_f = self.encode(x_factual)
         b_cf, s_cf = self.encode(x_counterfactual)
 
-        # Decode each branch independently to get raw outputs
-        # (needed for monotonicity penalty: cf should >= f)
+        # Decode factual branch (no deep supervision needed)
         out_f = self.decode(b_f, s_f)
-        out_cf = self.decode(b_cf, s_cf)
 
-        # Joint fusion for the delta prediction
-        b_diff = b_cf - b_f
-        feat_diff = {
-            "s1": s_cf["s1"] - s_f["s1"],
-            "s2": s_cf["s2"] - s_f["s2"],
-            "s3": s_cf["s3"] - s_f["s3"],
-            "s4": b_diff
+        # Decode counterfactual branch WITH deep supervision
+        feat_cf = {
+            "s1": s_cf["s1"],
+            "s2": s_cf["s2"],
+            "s3": s_cf["s3"],
+            "s4": b_cf,
         }
-
-        result = self.decoder(feat_diff, return_deep=True)
+        result = self.decoder(feat_cf, return_deep=True)
         if isinstance(result, tuple):
-            out_diff, deep_diff = result
+            out_cf, deep_cf = result
         else:
-            out_diff, deep_diff = result, []
+            out_cf, deep_cf = result, []
 
-        delta = torch.clamp(out_diff, 0.0, 1.0)
-        deep_deltas = [torch.clamp(d, 0.0, 1.0) for d in deep_diff]
+        # Main delta = cf - f in output space
+        delta = torch.clamp(out_cf - out_f, 0.0, 1.0)
+
+        # Deep supervision deltas: each aux cf output minus the
+        # factual output (resized to match aux resolution)
+        deep_deltas = []
+        for aux_cf in deep_cf:
+            if aux_cf.shape[2:] != out_f.shape[2:]:
+                out_f_resized = F.interpolate(
+                    out_f, size=aux_cf.shape[2:],
+                    mode="bilinear", align_corners=False,
+                )
+            else:
+                out_f_resized = out_f
+            deep_deltas.append(torch.clamp(aux_cf - out_f_resized, 0.0, 1.0))
 
         return delta, deep_deltas, out_f, out_cf
 

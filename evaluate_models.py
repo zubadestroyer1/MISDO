@@ -128,6 +128,39 @@ def compute_pixel_metrics(
     }
 
 
+def _find_optimal_threshold(
+    pred: np.ndarray,
+    target: np.ndarray,
+    thresholds: List[float] | None = None,
+) -> Tuple[float, float]:
+    """Find the threshold that maximises F1 score.
+
+    Returns (best_threshold, best_f1).
+    """
+    if thresholds is None:
+        thresholds = [i * 0.05 for i in range(1, 20)]  # 0.05 to 0.95
+
+    pred_flat = pred.ravel()
+    tgt_flat = target.ravel()
+    best_f1 = 0.0
+    best_th = 0.5
+
+    for th in thresholds:
+        pred_bin = (pred_flat > th).astype(np.float32)
+        tgt_bin = (tgt_flat > th).astype(np.float32)
+        tp = float((pred_bin * tgt_bin).sum())
+        fp = float((pred_bin * (1 - tgt_bin)).sum())
+        fn = float(((1 - pred_bin) * tgt_bin).sum())
+        prec = _safe_div(tp, tp + fp)
+        rec = _safe_div(tp, tp + fn)
+        f1 = _safe_div(2 * prec * rec, prec + rec)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_th = th
+
+    return best_th, best_f1
+
+
 def _compute_auroc(scores: np.ndarray, labels: np.ndarray) -> float:
     """Compute AUROC without sklearn using the trapezoidal rule."""
     if labels.sum() == 0 or labels.sum() == len(labels):
@@ -308,6 +341,12 @@ def evaluate_model(
         return {"error": "no weights"}
 
     state = torch.load(weight_path, map_location=device, weights_only=True)
+    # Defence-in-depth: strip "module." prefix from state dict keys if
+    # the checkpoint was saved from a DataParallel / DDP-wrapped model.
+    # New training code (post-audit) saves base_model.state_dict() directly,
+    # but this handles older checkpoints gracefully.
+    if any(k.startswith("module.") for k in state.keys()):
+        state = {k.removeprefix("module."): v for k, v in state.items()}
     model.load_state_dict(state, strict=True)
     model.eval()
 
@@ -377,13 +416,25 @@ def evaluate_model(
 
     # ── Aggregate pixel metrics across all samples ──
     pixel_metrics = compute_pixel_metrics(all_preds_arr, all_targets_arr, threshold)
-    print(f"\n  Pixel Metrics:")
+
+    # ── Optimal threshold search ──
+    opt_th, opt_f1 = _find_optimal_threshold(all_preds_arr, all_targets_arr)
+    opt_metrics = compute_pixel_metrics(all_preds_arr, all_targets_arr, opt_th)
+    pixel_metrics["optimal_threshold"] = round(opt_th, 3)
+    pixel_metrics["f1_at_optimal"] = round(opt_f1, 4)
+    pixel_metrics["precision_at_optimal"] = opt_metrics["precision"]
+    pixel_metrics["recall_at_optimal"] = opt_metrics["recall"]
+
+    print(f"\n  Pixel Metrics (threshold={threshold}):")
     print(f"    MSE={pixel_metrics['mse']:.6f}  MAE={pixel_metrics['mae']:.6f}  "
           f"RMSE={pixel_metrics['rmse']:.6f}")
     print(f"    Pearson={pixel_metrics['pearson']:.4f}  "
           f"Dice={pixel_metrics['dice']:.4f}  IoU={pixel_metrics['iou']:.4f}")
     print(f"    P={pixel_metrics['precision']:.4f}  R={pixel_metrics['recall']:.4f}  "
           f"F1={pixel_metrics['f1']:.4f}  AUROC={pixel_metrics['auroc']:.4f}")
+    print(f"  Optimal Threshold: {opt_th:.3f}")
+    print(f"    P={opt_metrics['precision']:.4f}  R={opt_metrics['recall']:.4f}  "
+          f"F1={opt_f1:.4f}")
 
     # ── Per-sample spatial metrics (average across samples) ──
     ssim_scores = []

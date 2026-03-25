@@ -262,7 +262,7 @@ def compute_global_target_scale(
         elif model_name == "soil":
             # Replicate the FULL RealSoilDataset target computation:
             # exposure_delta + cascade_exposure*0.5 → control_baseline → SMAP weighting
-            slope = np.nan_to_num(data.get("srtm_slope", np.zeros_like(tc))).astype(np.float32)
+            slope = np.clip(np.nan_to_num(data.get("srtm_slope", np.zeros_like(tc))), 0, 1).astype(np.float32)
 
             # Exposure delta (same as __getitem__)
             exposed_before = (tc < 0.3).astype(np.float32)
@@ -309,8 +309,16 @@ def compute_global_target_scale(
             maxima.append(chip_max)
 
     if not maxima:
-        print(f"  ⚠ Could not compute target scale for {model_name} "
-              f"(no valid chips). Using 1.0")
+        msg = (
+            f"Could not compute target scale for {model_name}: "
+            f"no valid chips found in '{split}' split. "
+        )
+        if model_name == "hydro":
+            msg += (
+                "Ensure download_msi_smap.py has been run and "
+                "chips contain 'msi_ndssi_delta' key."
+            )
+        print(f"  \u26a0 {msg} Falling back to 1.0")
         return 1.0
 
     scale = float(np.percentile(maxima, percentile))
@@ -524,7 +532,7 @@ class RealHansenDataset(Dataset):
 
         treecover = data["treecover2000"].astype(np.float32)
         lossyear = data["lossyear"].astype(np.float32)
-        gain = data["gain"].astype(np.float32)
+        gain = data.get("gain", np.zeros_like(treecover)).astype(np.float32)
 
         tc_norm = treecover / 100.0
 
@@ -694,8 +702,8 @@ class RealFireDataset(Dataset):
             else False
         )
 
-        slope = np.nan_to_num(data.get("srtm_slope", np.zeros_like(tc))).astype(np.float32)
-        elevation = np.nan_to_num(data.get("srtm_elevation", np.zeros_like(tc))).astype(np.float32)
+        slope = np.clip(np.nan_to_num(data.get("srtm_slope", np.zeros_like(tc))), 0, 1).astype(np.float32)
+        elevation = np.clip(np.nan_to_num(data.get("srtm_elevation", np.zeros_like(tc))), 0, 1).astype(np.float32)
 
         # ── Sample temporal window ──
         t1, t2, t_impact = _sample_window(
@@ -924,10 +932,10 @@ class RealHydroDataset(Dataset):
         tc = data["treecover2000"].astype(np.float32) / 100.0
         lossyear = data["lossyear"].astype(np.float32)
 
-        elevation = np.nan_to_num(data.get("srtm_elevation", np.zeros_like(tc))).astype(np.float32)
-        slope = np.nan_to_num(data.get("srtm_slope", np.zeros_like(tc))).astype(np.float32)
-        aspect = np.nan_to_num(data.get("srtm_aspect", np.zeros_like(tc))).astype(np.float32)
-        flow_acc = np.nan_to_num(data.get("srtm_flow_acc", np.zeros_like(tc))).astype(np.float32)
+        elevation = np.clip(np.nan_to_num(data.get("srtm_elevation", np.zeros_like(tc))), 0, 1).astype(np.float32)
+        slope = np.clip(np.nan_to_num(data.get("srtm_slope", np.zeros_like(tc))), 0, 1).astype(np.float32)
+        aspect = np.clip(np.nan_to_num(data.get("srtm_aspect", np.zeros_like(tc))), 0, 1).astype(np.float32)
+        flow_acc = np.clip(np.nan_to_num(data.get("srtm_flow_acc", np.zeros_like(tc))), 0, 1).astype(np.float32)
 
         # ── Fixed temporal window (must match download_msi_smap.py) ──
         # The NDSSI target is baked to 2016→2020 at download time, so
@@ -960,6 +968,33 @@ class RealHydroDataset(Dataset):
 
         # ── Real Sentinel-2 NDSSI Target ──
         # Fetch actual water pollution / suspended sediment delta
+        # Skip chips that lack real MSI data (retry with another chip)
+        if "msi_ndssi_delta" not in data or np.all(data["msi_ndssi_delta"] == 0):
+            # This chip has no real NDSSI target — retry with a different chip
+            idx2 = np.random.randint(len(self.entries))
+            entry2 = self.entries[idx2]
+            file2 = _resolve_chip_path(self.tiles_dir, entry2["file"])
+            try:
+                data2 = np.load(file2)
+                if "msi_ndssi_delta" in data2 and not np.all(data2["msi_ndssi_delta"] == 0):
+                    data = data2
+                    # Re-read inputs from the new chip
+                    tc = data["treecover2000"].astype(np.float32) / 100.0
+                    lossyear = data["lossyear"].astype(np.float32)
+                    elevation = np.clip(np.nan_to_num(data.get("srtm_elevation", np.zeros_like(tc))), 0, 1).astype(np.float32)
+                    slope = np.clip(np.nan_to_num(data.get("srtm_slope", np.zeros_like(tc))), 0, 1).astype(np.float32)
+                    aspect = np.clip(np.nan_to_num(data.get("srtm_aspect", np.zeros_like(tc))), 0, 1).astype(np.float32)
+                    flow_acc = np.clip(np.nan_to_num(data.get("srtm_flow_acc", np.zeros_like(tc))), 0, 1).astype(np.float32)
+                    # Recompute deforestation mask
+                    deforestation_mask = ((lossyear > t1) & (lossyear <= t2)).astype(np.float32)
+                    no_deforestation = np.zeros_like(deforestation_mask)
+                    forest = tc.copy()
+                    forest[(lossyear > 0) & (lossyear <= t2)] = 0.0
+                    obs_f = np.stack([elevation, slope, aspect, flow_acc, forest, no_deforestation], axis=0)
+                    obs_cf = np.stack([elevation, slope, aspect, flow_acc, forest, deforestation_mask], axis=0)
+            except Exception:
+                pass  # Fall through to zero target
+
         pollution_delta = data.get("msi_ndssi_delta", np.zeros_like(tc)).astype(np.float32)
 
         if self.target_scale is not None:
@@ -1059,8 +1094,8 @@ class RealSoilDataset(Dataset):
         tc = data["treecover2000"].astype(np.float32) / 100.0
         lossyear = data["lossyear"].astype(np.float32)
 
-        slope = np.nan_to_num(data.get("srtm_slope", np.zeros_like(tc))).astype(np.float32)
-        elevation = np.nan_to_num(data.get("srtm_elevation", np.zeros_like(tc))).astype(np.float32)
+        slope = np.clip(np.nan_to_num(data.get("srtm_slope", np.zeros_like(tc))), 0, 1).astype(np.float32)
+        elevation = np.clip(np.nan_to_num(data.get("srtm_elevation", np.zeros_like(tc))), 0, 1).astype(np.float32)
 
         # ── Sample temporal window ──
         t1, t2, t_impact = _sample_window(

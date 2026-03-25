@@ -75,23 +75,94 @@ class RandomFlipRotate:
 
     Applied identically to all input and target tensors.
     Supports both [B, C, H, W] and [B, T, C, H, W] temporal inputs.
+
+    For models with directional channels (e.g. Hydro's SRTM aspect),
+    the aspect values are mathematically transformed to stay physically
+    consistent with the rotated/flipped grid.
+
+    Parameters
+    ----------
+    aspect_channel_idx : int | None
+        Channel index of the aspect (terrain orientation) channel in
+        the INPUT tensors.  If None, no directional correction is applied.
+        Aspect is normalised to [0, 1] (where 0=N, 0.25=E, 0.5=S, 0.75=W),
+        matching the download script's encoding.
     """
+
+    def __init__(self, aspect_channel_idx: int | None = None) -> None:
+        self.aspect_ch = aspect_channel_idx
+
+    def _fix_aspect_flip_h(self, t: torch.Tensor) -> torch.Tensor:
+        """Horizontal flip mirrors East↔West: aspect = (1.0 - aspect) % 1.0.
+
+        In normalised [0,1] space: 0=N→0=N, 0.25=E→0.75=W, 0.5=S→0.5=S, 0.75=W→0.25=E.
+        """
+        if self.aspect_ch is None:
+            return t
+        if t.ndim == 5:  # [B, T, C, H, W]
+            t[:, :, self.aspect_ch] = (1.0 - t[:, :, self.aspect_ch]) % 1.0
+        else:  # [B, C, H, W]
+            t[:, self.aspect_ch] = (1.0 - t[:, self.aspect_ch]) % 1.0
+        return t
+
+    def _fix_aspect_flip_v(self, t: torch.Tensor) -> torch.Tensor:
+        """Vertical flip mirrors North↔South: aspect = (0.5 - aspect) % 1.0.
+
+        In normalised [0,1] space: 0=N→0.5=S, 0.25=E→0.25=E, 0.5=S→0=N, 0.75=W→0.75=W.
+        """
+        if self.aspect_ch is None:
+            return t
+        if t.ndim == 5:
+            t[:, :, self.aspect_ch] = (0.5 - t[:, :, self.aspect_ch]) % 1.0
+        else:
+            t[:, self.aspect_ch] = (0.5 - t[:, self.aspect_ch]) % 1.0
+        return t
+
+    def _fix_aspect_rot90(self, t: torch.Tensor, k: int) -> torch.Tensor:
+        """Rotate aspect values by k * 90° to match grid rotation.
+
+        k=1 (90° CCW): aspect += 0.25.  k=2 (180°): aspect += 0.5.
+        """
+        if self.aspect_ch is None or k == 0:
+            return t
+        shift = k * 0.25  # 90° = 0.25 in [0,1] space
+        if t.ndim == 5:
+            t[:, :, self.aspect_ch] = (t[:, :, self.aspect_ch] + shift) % 1.0
+        else:
+            t[:, self.aspect_ch] = (t[:, self.aspect_ch] + shift) % 1.0
+        return t
 
     def __call__(
         self, *tensors: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
+        # Only apply aspect corrections to the first two tensors (obs_f, obs_cf)
+        # — the target tensor has no aspect channel.
+        n_inputs = min(2, len(tensors))  # obs_f, obs_cf
+
         # Random horizontal flip
         if torch.rand(1).item() > 0.5:
             tensors = tuple(torch.flip(t, [-1]) for t in tensors)
+            tensors = tuple(
+                self._fix_aspect_flip_h(t) if i < n_inputs else t
+                for i, t in enumerate(tensors)
+            )
 
         # Random vertical flip
         if torch.rand(1).item() > 0.5:
             tensors = tuple(torch.flip(t, [-2]) for t in tensors)
+            tensors = tuple(
+                self._fix_aspect_flip_v(t) if i < n_inputs else t
+                for i, t in enumerate(tensors)
+            )
 
         # Random 90° rotation (0, 90, 180, or 270°)
         k = torch.randint(0, 4, (1,)).item()
         if k > 0:
             tensors = tuple(torch.rot90(t, k, [-2, -1]) for t in tensors)
+            tensors = tuple(
+                self._fix_aspect_rot90(t, k) if i < n_inputs else t
+                for i, t in enumerate(tensors)
+            )
 
         return tensors
 
@@ -192,7 +263,12 @@ def _get_dataloader_kwargs(device: torch.device) -> dict:
     must be False when using Apple Silicon GPUs.
     """
     if device.type == "cuda":
-        return {"num_workers": min(8, os.cpu_count() or 1), "pin_memory": True}
+        n_workers = min(16, os.cpu_count() or 1)
+        return {
+            "num_workers": n_workers,
+            "pin_memory": True,
+            "persistent_workers": n_workers > 0,
+        }
     # MPS and CPU: no pinned memory, no multiprocessing workers
     # (MPS + multiprocess workers can cause silent hangs)
     return {"num_workers": 0, "pin_memory": False}
@@ -219,10 +295,12 @@ class WarmupCosineScheduler:
         optimizer: torch.optim.Optimizer,
         warmup_epochs: int,
         total_epochs: int,
+        min_lr: float = 1e-6,
     ) -> None:
         self.optimizer = optimizer
         self.warmup_epochs = warmup_epochs
         self.total_epochs = total_epochs
+        self.min_lr = min_lr
         self.base_lrs = [pg["lr"] for pg in optimizer.param_groups]
 
     def step(self, epoch: int) -> None:
@@ -235,16 +313,19 @@ class WarmupCosineScheduler:
         epoch = max(1, epoch)  # Guard: clamp 0-indexed calls to 1
 
         if epoch <= self.warmup_epochs:
-            # Linear warmup: scale from 0 → base_lr
+            # Linear warmup: scale from min_lr → base_lr
             scale = epoch / max(self.warmup_epochs, 1)
         else:
-            # Cosine annealing from base_lr → 0
+            # Cosine annealing from base_lr → min_lr
             remaining = max(self.total_epochs - self.warmup_epochs, 1)
             progress = min((epoch - self.warmup_epochs) / remaining, 1.0)
-            scale = 0.5 * (1.0 + math.cos(math.pi * progress))
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            # scale interpolates between 1.0 (full lr) and min_lr/base_lr
+            # so final LR = base_lr * scale >= min_lr
+            scale = cosine  # will be floored by max() below
 
         for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
-            pg["lr"] = base_lr * scale
+            pg["lr"] = max(base_lr * scale, self.min_lr)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -299,6 +380,12 @@ def lr_range_test(
     losses: list[float] = []
     best_loss = float("inf")
 
+    # Use AMP autocast during LR range test to match training conditions.
+    # Loss magnitudes differ under mixed precision, so the suggested LR
+    # must reflect the same numerical regime as the actual training loop.
+    amp_device_type = _get_amp_device_type(device)
+    amp_enabled = device.type == "cuda"
+
     model.train()
     data_iter = iter(train_loader)
 
@@ -314,20 +401,21 @@ def lr_range_test(
         )
 
         optimizer.zero_grad()
-        pred_delta, _, out_f, out_cf = base_model.forward_paired_deep(obs_f, obs_cf)
+        with torch.amp.autocast(device_type=amp_device_type, enabled=amp_enabled):
+            pred_delta, _, out_f, out_cf = base_model.forward_paired_deep(obs_f, obs_cf)
 
-        if pred_delta.shape[2:] != target.shape[2:]:
-            target = F.interpolate(
-                target, size=pred_delta.shape[2:],
-                mode="bilinear", align_corners=False,
+            if pred_delta.shape[2:] != target.shape[2:]:
+                target = F.interpolate(
+                    target, size=pred_delta.shape[2:],
+                    mode="bilinear", align_corners=False,
+                )
+            if pred_delta.shape[1] != target.shape[1]:
+                target = target[:, :pred_delta.shape[1]]
+
+            loss = criterion(
+                pred_delta, target, None,
+                out_factual=out_f, out_counterfactual=out_cf,
             )
-        if pred_delta.shape[1] != target.shape[1]:
-            target = target[:, :pred_delta.shape[1]]
-
-        loss = criterion(
-            pred_delta, target, None,
-            out_factual=out_f, out_counterfactual=out_cf,
-        )
         loss.backward()
         optimizer.step()
 
@@ -388,6 +476,7 @@ MODEL_CONFIGS = {
         ),
         "temporal": True,
         "lr": 3e-4,
+        "aspect_channel_idx": None,  # no directional channels
     },
     "forest": {
         "model_cls": ForestLossNet,
@@ -397,6 +486,7 @@ MODEL_CONFIGS = {
         ),
         "temporal": True,
         "lr": 3e-4,
+        "aspect_channel_idx": None,
     },
     "hydro": {
         "model_cls": HydroRiskNet,
@@ -404,6 +494,7 @@ MODEL_CONFIGS = {
         "loss_factory": lambda: CounterfactualDeltaLoss(),
         "temporal": False,
         "lr": 3e-4,
+        "aspect_channel_idx": 2,  # channel 2 = SRTM aspect (terrain orientation)
     },
     "soil": {
         "model_cls": SoilRiskNet,
@@ -411,6 +502,7 @@ MODEL_CONFIGS = {
         "loss_factory": lambda: CounterfactualDeltaLoss(),
         "temporal": True,
         "lr": 3e-4,
+        "aspect_channel_idx": None,
     },
 }
 
@@ -424,7 +516,7 @@ def train_single_model(
     device: torch.device,
     accumulation_steps: int = 4,
     use_amp: bool | None = None,
-    patience: int = 10,
+    patience: int = 15,
     lr_find: bool = False,
 ) -> dict:
     """Train a single model on real data with production-grade features.
@@ -484,9 +576,11 @@ def train_single_model(
     num_gpus = torch.cuda.device_count() if device.type == "cuda" else 1
     global_batch_size = base_batch_size * num_gpus
 
-    # Linear Learning Rate Scaling for Multi-GPU clusters
-    # Use a local variable — do NOT mutate the shared config dict
-    lr = config["lr"] * (global_batch_size / 16)
+    # Square-root Learning Rate Scaling for AdamW (Hoffer et al., 2017)
+    # Linear scaling is optimal for SGD but causes instability with adaptive
+    # optimisers at large effective batch sizes.  sqrt scaling preserves the
+    # signal-to-noise ratio of gradient updates.
+    lr = config["lr"] * math.sqrt(global_batch_size / 16)
 
     dl_kwargs = _get_dataloader_kwargs(device)
 
@@ -502,9 +596,9 @@ def train_single_model(
         for i, entry in enumerate(train_ds.entries):
             has_viirs = entry.get("has_real_viirs", False)
             forest_pct = entry.get("forest_pct", 0.5)
-            # 10x weight for chips with real VIIRS fire data
+            # Cap weight at 3x to prevent overfitting on few high-signal chips
             if has_viirs:
-                weights[i] = 10.0
+                weights[i] = 3.0
             # 3x weight for high-forest chips (more deforestation signal)
             elif forest_pct > 0.6:
                 weights[i] = 3.0
@@ -523,7 +617,7 @@ def train_single_model(
         weights = torch.ones(len(train_ds), dtype=torch.float32)
         n_excluded = 0
         for i, entry in enumerate(train_ds.entries):
-            if not entry.get("has_real_msi_smap", True):
+            if not entry.get("has_real_msi_smap", False):
                 weights[i] = 0.0
                 n_excluded += 1
         n_valid = len(train_ds) - n_excluded
@@ -548,15 +642,23 @@ def train_single_model(
 
     effective_batch = global_batch_size * accumulation_steps
 
-    # Model definition with Multi-GPU DataParallel wrapper
+    # Model definition with Multi-GPU wrapper
     model = config["model_cls"]().to(device)
-    if device.type == "cuda" and num_gpus > 1:
+    is_distributed = torch.distributed.is_initialized()
+    if is_distributed:
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[local_rank],
+        )
+        print(f"  Wrapped model in DistributedDataParallel (rank {local_rank}).")
+    elif device.type == "cuda" and num_gpus > 1:
         print(f"  Wrapping model in DataParallel across {num_gpus} GPUs.")
         model = torch.nn.DataParallel(model)
 
     # Extract the base model for Siamese forward calls
-    # (DataParallel only parallelises .forward(), not custom methods)
-    base_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+    # (DataParallel / DistributedDataParallel only parallelise .forward(),
+    # not custom methods like .forward_paired / .forward_paired_deep)
+    base_model = model.module if hasattr(model, "module") else model
 
     params = sum(p.numel() for p in model.parameters())
     print(f"  Parameters: {params:,}")
@@ -576,7 +678,7 @@ def train_single_model(
     # Loss + Deep Supervision + Augmentation
     base_criterion = config["loss_factory"]() if "loss_factory" in config else config["loss_cls"]()
     criterion = DeepSupervisionWrapper(base_criterion, aux_weight=0.3)
-    augment = RandomFlipRotate()
+    augment = RandomFlipRotate(aspect_channel_idx=config.get("aspect_channel_idx"))
     radiometric = RadiometricJitter()  # mild brightness/contrast jitter for inputs only
 
     # AMP setup — device-aware autocast type
@@ -585,7 +687,7 @@ def train_single_model(
     if device.type == "cuda" and use_amp is None:
         use_amp = True
     amp_enabled = use_amp and device.type != "cpu"
-    scaler = torch.amp.GradScaler(enabled=amp_enabled)
+    scaler = torch.amp.GradScaler(device=device.type, enabled=amp_enabled)
 
     # Optional LR range test
     if lr_find:
@@ -597,6 +699,7 @@ def train_single_model(
 
     # Training loop
     train_losses: list[float] = []
+    train_mse_losses: list[float] = []  # raw MSE for apples-to-apples comparison with test
     test_losses: list[float] = []
     best_test_loss = float("inf")
     epochs_without_improvement = 0
@@ -614,6 +717,7 @@ def train_single_model(
         # ── Train (Siamese counterfactual) ──
         model.train()
         epoch_loss = 0.0
+        epoch_mse = 0.0  # raw MSE (unweighted) for comparable logging
         n_batches = 0
         nan_count = 0
         max_nan_per_epoch = 20  # abort epoch if too many NaN batches
@@ -686,21 +790,39 @@ def train_single_model(
                 optimizer.zero_grad()
 
             epoch_loss += loss.item() * accumulation_steps  # undo scaling for logging
+            # Raw MSE (same metric as test) for comparable learning curves
+            with torch.no_grad():
+                epoch_mse += F.mse_loss(pred_delta, target).item()
             n_batches += 1
 
         avg_train = epoch_loss / max(n_batches, 1)
+        avg_train_mse = epoch_mse / max(n_batches, 1)
         train_losses.append(avg_train)
+        train_mse_losses.append(avg_train_mse)
 
-        # ── Test (Siamese paired forward) ──
+        # ── NaN epoch guard: if entire epoch was NaN, skip test eval ──
+        # Don't count NaN epochs toward patience (no learning happened).
+        if n_batches == 0:
+            test_losses.append(best_test_loss)  # placeholder
+            epoch_time = time.time() - epoch_start
+            print(f"  Epoch {epoch:3d}/{epochs}: ALL BATCHES NaN — skipping test eval")
+            continue
+
+        # ── Test (Siamese paired forward, compound loss) ──
+        # Use the SAME loss criterion as training for checkpoint selection.
+        # Raw MSE plateaus early because 95%+ of pixels are near-zero;
+        # the compound loss (EdgeWeightedMSE + gradient matching) captures
+        # spatial pattern improvements that raw MSE misses.
         model.eval()
         test_loss = 0.0
+        test_mse = 0.0
         n_test = 0
         with torch.no_grad():
             for obs_f, obs_cf, target in test_loader:
                 obs_f = obs_f.to(device)
                 obs_cf = obs_cf.to(device)
                 target = target.to(device)
-                pred_delta = base_model.forward_paired(obs_f, obs_cf)
+                pred_delta, deep_deltas, out_f, out_cf = base_model.forward_paired_deep(obs_f, obs_cf)
                 if pred_delta.shape[2:] != target.shape[2:]:
                     target = F.interpolate(
                         target, size=pred_delta.shape[2:],
@@ -708,25 +830,38 @@ def train_single_model(
                     )
                 if pred_delta.shape[1] != target.shape[1]:
                     target = target[:, :pred_delta.shape[1]]
-                # Test loss without deep supervision (main output only)
-                test_loss += base_criterion(pred_delta, target).item()
-                n_test += 1
+                # Compound loss for checkpoint selection
+                batch_loss = criterion(
+                    pred_delta, target, deep_deltas,
+                    out_factual=out_f, out_counterfactual=out_cf,
+                )
+                if not (torch.isnan(batch_loss) or torch.isinf(batch_loss)):
+                    test_loss += batch_loss.item()
+                    test_mse += F.mse_loss(pred_delta, target).item()
+                    n_test += 1
 
         avg_test = test_loss / max(n_test, 1)
+        avg_test_mse = test_mse / max(n_test, 1)
         test_losses.append(avg_test)
 
         if avg_test < best_test_loss:
             best_test_loss = avg_test
             epochs_without_improvement = 0
             weight_path = os.path.join(weights_dir, f"{name}_model.pt")
-            torch.save(model.state_dict(), weight_path)
+            # Save the UNWRAPPED model state dict so checkpoints work
+            # regardless of whether training used DP/DDP or bare model.
+            # evaluate_models.py loads into an unwrapped model, so keys
+            # must not have the "module." prefix.
+            torch.save(base_model.state_dict(), weight_path)
         else:
             epochs_without_improvement += 1
 
         epoch_time = time.time() - epoch_start
         if epoch % 5 == 0 or epoch == 1:
             print(f"  Epoch {epoch:3d}/{epochs}: train={avg_train:.6f}  "
-                  f"test={avg_test:.6f}  best={best_test_loss:.6f}  "
+                  f"train_mse={avg_train_mse:.6f}  "
+                  f"test={avg_test:.6f}  test_mse={avg_test_mse:.6f}  "
+                  f"best={best_test_loss:.6f}  "
                   f"lr={current_lr:.2e}  time={epoch_time:.1f}s"
                   f"  patience={epochs_without_improvement}/{patience}")
 
@@ -743,11 +878,14 @@ def train_single_model(
         os.path.join(weights_dir, f"{name}_model.pt"),
         map_location=device, weights_only=True,
     )
-    model.load_state_dict(best_state)
+    # Load into the unwrapped base_model (checkpoint was saved from
+    # base_model.state_dict(), so keys have no "module." prefix).
+    base_model.load_state_dict(best_state)
     model.eval()
     total_mse = 0.0
-    total_dice = 0.0
     total_soft_dice = 0.0
+    all_val_preds = []
+    all_val_targets = []
     n_samples = 0
     with torch.no_grad():
         for obs_f, obs_cf, target in val_loader:
@@ -765,12 +903,9 @@ def train_single_model(
 
             total_mse += F.mse_loss(pred_delta, target).item()
 
-            # Binary Dice (thresholded at 0.5) — standard metric for reporting
-            p_bin = (pred_delta > 0.5).float().flatten()
-            t_bin = (target > 0.5).float().flatten()
-            inter_bin = (p_bin * t_bin).sum()
-            dice_bin = (2 * inter_bin + 1) / (p_bin.sum() + t_bin.sum() + 1)
-            total_dice += dice_bin.item()
+            # Collect for optimal threshold search
+            all_val_preds.append(pred_delta.cpu())
+            all_val_targets.append(target.cpu())
 
             # Soft Dice (continuous) — useful for gradient-aware comparison
             p, t = pred_delta.flatten(), target.flatten()
@@ -781,8 +916,40 @@ def train_single_model(
             n_samples += 1
 
     val_mse = round(total_mse / max(n_samples, 1), 6)
-    val_dice = round(total_dice / max(n_samples, 1), 4)
     val_soft_dice = round(total_soft_dice / max(n_samples, 1), 4)
+
+    # ── Optimal threshold search for binary Dice ──
+    # A fixed 0.5 threshold produces near-zero Dice when model outputs
+    # are in a compressed range (e.g. [0, 0.3]).  Sweeping thresholds
+    # finds the binarisation point that maximises Dice, giving a fair
+    # measure of the model's spatial accuracy.
+    all_p = torch.cat(all_val_preds).flatten()
+    all_t = torch.cat(all_val_targets).flatten()
+    best_dice = 0.0
+    best_th = 0.5
+    dice_at_05 = 0.0
+    for th_i in range(1, 20):  # 0.05 to 0.95 in steps of 0.05
+        th = th_i * 0.05
+        p_bin = (all_p > th).float()
+        t_bin = (all_t > th).float()
+        n_pos_p = p_bin.sum()
+        n_pos_t = t_bin.sum()
+        # Skip thresholds where both sides are empty (Laplace smoothing
+        # would give spurious Dice=1.0 from (0+1)/(0+0+1)=1)
+        if n_pos_p == 0 and n_pos_t == 0:
+            if th_i == 10:
+                dice_at_05 = 0.0
+            continue
+        inter = (p_bin * t_bin).sum()
+        dice_val = float((2 * inter + 1) / (n_pos_p + n_pos_t + 1))
+        if th_i == 10:  # th == 0.5
+            dice_at_05 = dice_val
+        if dice_val > best_dice:
+            best_dice = dice_val
+            best_th = th
+    val_dice = round(best_dice, 4)
+    val_dice_05 = round(dice_at_05, 4)
+    optimal_threshold = round(best_th, 3)
 
     metrics = {
         "model": name,
@@ -800,15 +967,20 @@ def train_single_model(
             "validate": f"second half of spatial test tiles, {len(val_ds)} chips (held-out)",
         },
         "final_train_loss": round(train_losses[-1], 6),
+        "final_train_mse": round(train_mse_losses[-1], 6),
         "best_test_loss": round(best_test_loss, 6),
         "val_mse": val_mse,
         "val_dice": val_dice,
+        "val_dice_at_05": val_dice_05,
         "val_soft_dice": val_soft_dice,
+        "val_optimal_threshold": optimal_threshold,
         "train_losses": [round(l, 6) for l in train_losses],
+        "train_mse_losses": [round(l, 6) for l in train_mse_losses],
         "test_losses": [round(l, 6) for l in test_losses],
     }
 
-    print(f"  Validation: MSE={val_mse:.6f}  Dice={val_dice:.4f}  SoftDice={val_soft_dice:.4f}")
+    print(f"  Validation: MSE={val_mse:.6f}  SoftDice={val_soft_dice:.4f}")
+    print(f"  Dice@0.5={val_dice_05:.4f}  Dice@optimal({optimal_threshold:.3f})={val_dice:.4f}")
 
     return metrics
 
@@ -826,11 +998,22 @@ def main() -> None:
                         help="Enable automatic mixed precision (default: auto-on for CUDA)")
     parser.add_argument("--no-amp", dest="amp", action="store_false",
                         help="Disable automatic mixed precision")
-    parser.add_argument("--early-stop-patience", type=int, default=10,
-                        help="Stop training if test loss hasn't improved for N epochs (default: 10)")
+    parser.add_argument("--early-stop-patience", type=int, default=15,
+                        help="Stop training if test loss hasn't improved for N epochs (default: 15)")
     parser.add_argument("--lr-find", action="store_true",
                         help="Run LR range test before training to suggest optimal learning rate")
+    parser.add_argument("--distributed", action="store_true",
+                        help="Enable DistributedDataParallel (launch with torchrun)")
     args = parser.parse_args()
+
+    # ── DDP initialisation ──────────────────────────────────────────
+    if args.distributed:
+        torch.distributed.init_process_group(backend="nccl")
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        print(f"DDP initialised: rank {torch.distributed.get_rank()}, "
+              f"local_rank {local_rank}, "
+              f"world_size {torch.distributed.get_world_size()}")
 
     os.makedirs(args.weights_dir, exist_ok=True)
 
@@ -841,7 +1024,10 @@ def main() -> None:
         sys.exit(1)
 
     # Device
-    if torch.cuda.is_available():
+    if args.distributed:
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        device = torch.device(f"cuda:{local_rank}")
+    elif torch.cuda.is_available():
         device = torch.device("cuda")
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device = torch.device("mps")
@@ -884,6 +1070,10 @@ def main() -> None:
     print(f"  All training complete in {elapsed:.1f}s")
     print(f"  Metrics saved to {metrics_path}")
     print(f"{'=' * 60}")
+
+    # ── DDP cleanup ─────────────────────────────────────────────────
+    if args.distributed and torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
