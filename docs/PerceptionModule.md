@@ -16,7 +16,7 @@ Phase 2: Fuse       — CrossDomainFusion exchanges bottleneck info
 Phase 3: Decode     — Each model's UNet++ decodes from enriched features
 ```
 
-**Input**: Dict of domain tensors `{"fire": [B,7,H,W], "forest": [B,6,H,W], "hydro": [B,6,H,W], "soil": [B,5,H,W]}`
+**Input**: Dict of domain tensors `{"fire": [B,7,H,W], "forest": [B,6,H,W], "hydro": [B,7,H,W], "soil": [B,7,H,W]}`
 
 **Output**: Stacked impact masks `[B, 4, 256, 256]` — counterfactual impact deltas per domain
 

@@ -168,10 +168,10 @@ python test_real_pipeline.py
 |---|---|---|---|
 | **Fire** (`FireRiskNet`) | 7ch temporal (VIIRS + defo mask) | Fire increase near clearing | VIIRS per-year rasters (real) |
 | **Forest** (`ForestLossNet`) | 6ch temporal (Hansen + defo mask) | Cascade deforestation | Hansen `lossyear` (real) |
-| **Hydro** (`HydroRiskNet`) | 6ch static (SRTM + defo mask) | Erosion increase downstream | Physics proxy on real events |
-| **Soil** (`SoilRiskNet`) | 5ch temporal (soil + defo mask) | Soil degradation increase | Physics proxy on real events |
+| **Hydro** (`HydroRiskNet`) | 7ch static (SRTM + MSI NDSSI + defo mask) | Erosion increase downstream | Sentinel-2 NDSSI + physics proxy |
+| **Soil** (`SoilRiskNet`) | 7ch temporal (SMAP + terrain + defo mask) | Soil degradation increase | TerraClimate SMAP + real terrain |
 
-All models use **Edge-Weighted MSE Loss** which upweights pixels near deforestation edges (3× weight).
+All models use **Focal Charbonnier + SSIM + Edge-Weighted MSE Loss** which upweights pixels near deforestation edges (3× weight) and uses focal modulation (γ=2.0) to prioritise impact zones.
 
 ### 4.2 Split Strategy
 
@@ -193,17 +193,17 @@ python train_real_models.py \
     --epochs 60 \
     --accumulation-steps 4 \
     --amp \
-    --early-stop-patience 10
+    --early-stop-patience 15
 ```
 
 **What this does:**
 - Trains all 4 models sequentially: Fire → Forest → Hydro → Soil
 - **Batch size**: 16 on CUDA (effective = 16 × 4 = 64)
 - **AMP**: Mixed precision for 2× speed
-- **LR**: warmup → cosine annealing (3e-4 for all models)
-- **Loss**: CounterfactualDeltaLoss wrapping Edge-Weighted MSE (upweights deforestation edge pixels)
-- **Deep supervision**: UNet++ auxiliary losses (weight=0.3)
-- **Radiometric jitter**: mild brightness/contrast perturbation (p=0.5) on inputs
+- **LR**: warmup → cosine annealing (Fire/Forest: 3e-4, Hydro: 2e-4, Soil: 2.5e-4)
+- **Loss**: CounterfactualDeltaLoss wrapping Focal Charbonnier + SSIM + Edge-Weighted MSE
+- **Deep supervision**: UNet++ auxiliary losses (weight=0.3), full-resolution re-computation
+- **Radiometric jitter**: per-model channel-aware brightness/contrast perturbation (p=0.5)
 - **Early stopping**: Halts if test loss doesn’t improve for 10 epochs
 
 ### 4.4 Train a Single Model
@@ -307,7 +307,7 @@ tar -czf misdo_weights_$(date +%Y%m%d).tar.gz weights/
 | `--epochs` | `60` | Max training epochs |
 | `--accumulation-steps` | `4` | Gradient accumulation (effective batch = batch_size × this) |
 | `--amp` | off | Enable mixed precision (always use on A100) |
-| `--early-stop-patience` | `10` | Epochs without improvement before stopping |
+| `--early-stop-patience` | `15` | Epochs without improvement before stopping |
 | `--tiles-dir` | `datasets/real_tiles` | Path to downloaded data |
 | `--weights-dir` | `weights` | Path to save model checkpoints |
 | `--viirs-archive` | — | Path to FIRMS bulk CSV directory (bypasses API rate limit) |

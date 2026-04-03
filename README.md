@@ -12,7 +12,7 @@ Instead of predicting static "risk maps," each model answers:
 
 > *"If I clear THIS area, how much does fire / cascade deforestation / erosion / soil degradation **increase** in the surrounding forest?"*
 
-This is learned from **real before-and-after satellite data** (Hansen GFC deforestation history + VIIRS fire detections), using temporal counterfactual targets with control-pixel baseline subtraction to isolate causal impact from background trends.
+This is learned from **real before-and-after satellite data** (Hansen GFC deforestation history + VIIRS fire detections + Sentinel-2 MSI + TerraClimate soil moisture), using temporal counterfactual targets with distance-weighted control-pixel baseline subtraction to isolate causal impact from background trends.
 
 ---
 
@@ -23,15 +23,15 @@ This is learned from **real before-and-after satellite data** (Hansen GFC defore
 │                          MISDO Pipeline                                │
 │                                                                        │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐               │
-│  │  VIIRS   │  │  Hansen  │  │  SRTM/   │  │  SMAP    │  Satellite    │
-│  │  Fire    │  │  GFC     │  │  Hydro   │  │  Soil    │  Data         │
+│  │  VIIRS   │  │  Hansen  │  │  SRTM +  │  │  SMAP +  │  Satellite    │
+│  │  Fire    │  │  GFC     │  │  MSI     │  │  Terrain │  Data         │
 │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘               │
 │       │              │              │              │                    │
 │       ▼              ▼              ▼              ▼                    │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐               │
-│  │ FireImpac│  │ Forest   │  │ HydroImp │  │ SoilImpa │  ConvNeXt-V2  │
-│  │ tNet     │  │ ImpactNet│  │ actNet   │  │ ctNet    │  + UNet++     │
-│  │ ~40M     │  │ ~40M     │  │ ~40M     │  │ ~40M     │  + Dilated    │
+│  │ FireRisk │  │ ForestLos│  │ HydroRis │  │ SoilRisk │  ConvNeXt-V2  │
+│  │ Net      │  │ sNet     │  │ kNet     │  │ Net      │  + UNet++     │
+│  │ 40.6M    │  │ 40.6M    │  │ 38.2M    │  │ 40.6M    │  + Dilated    │
 │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘    Context    │
 │       │              │              │              │                    │
 │       └──────┬───────┴──────┬───────┘              │                    │
@@ -58,31 +58,32 @@ This is learned from **real before-and-after satellite data** (Hansen GFC defore
 
 All models use a **ConvNeXt-V2 Base** encoder + **UNet++ decoder** + **DilatedContextModule** (ASPP) at bottleneck for long-range impact. Output uses ReLU + clamp(0,1) instead of sigmoid.
 
-| Model | Params | Input | Target | Loss |
+| Model | Params | Input | Target | Data Source |
 |---|---|---|---|---|
-| [FireRiskNet](docs/FireRiskNet.md) | ~40M | 7ch (VIIRS + defo mask) | Fire increase near clearing | Edge-Weighted MSE |
-| [ForestLossNet](docs/ForestLossNet.md) | ~40M | 6ch (Hansen + defo mask) | Cascade deforestation | Edge-Weighted MSE |
-| [HydroRiskNet](docs/HydroRiskNet.md) | ~40M | 6ch (SRTM + defo mask) | Erosion increase downstream | Edge-Weighted MSE |
-| [SoilRiskNet](docs/SoilRiskNet.md) | ~40M | 5ch (soil + defo mask) | Soil degradation increase | Edge-Weighted MSE |
+| [FireRiskNet](docs/FireRiskNet.md) | 40.6M | 7ch (VIIRS fire + defo mask) | Fire increase near clearing | VIIRS per-year rasters (real) |
+| [ForestLossNet](docs/ForestLossNet.md) | 40.6M | 6ch (Hansen + defo mask) | Cascade deforestation | Hansen `lossyear` (real) |
+| [HydroRiskNet](docs/HydroRiskNet.md) | 38.2M | 7ch (SRTM + MSI NDSSI + defo mask) | Erosion increase downstream | Sentinel-2 NDSSI + physics proxy |
+| [SoilRiskNet](docs/SoilRiskNet.md) | 40.6M | 7ch (SMAP + terrain + defo mask) | Soil degradation increase | TerraClimate SMAP + real terrain |
 
 ### Key Architecture Features
 
 - **ConvNeXt-V2 encoder** with Global Response Normalization (GRN) and stochastic depth
-- **UNet++ decoder** with nested dense skip connections and deep supervision
+- **UNet++ decoder** with nested dense skip connections and deep supervision (3 auxiliary heads)
 - **DilatedContextModule** (ASPP-style) at bottleneck — multi-rate dilated convolutions for 1–5 km impact propagation
-- **Multi-head temporal attention** for fusing multi-timestep inputs
-- **Deforestation mask input channel** — model knows WHERE clearing happened
+- **Multi-head temporal attention** for fusing multi-timestep inputs (Fire, Forest, Soil)
+- **Siamese counterfactual design** — paired forward pass isolates causal deforestation impact
 - **ReLU + clamp output** for sharper gradients on near-zero impact deltas
 
 ### Key Training Features
 
 - **Sliding temporal windows** — ~100 samples per chip (vs 1 with fixed windows)
-- **Control-pixel baseline subtraction** — isolates causal signal from background trends
-- **LR**: warmup → cosine annealing (3e-4 for all models)
-- **Loss**: CounterfactualDeltaLoss wrapping Edge-Weighted MSE (3× upweight near deforestation edges)
-- **Deep supervision**: UNet++ auxiliary losses (weight=0.3)
-- **Radiometric jitter**: mild brightness/contrast perturbation (p=0.5) to reduce overfitting to radiometric noise
-- **Early stopping**: Halts if test loss doesn't improve for 10 epochs
+- **Distance-weighted control baselines** — Gaussian decay weighting for causal impact isolation
+- **Per-model learning rates**: Fire/Forest 3e-4, Hydro 2e-4, Soil 2.5e-4
+- **Loss**: Focal Charbonnier + SSIM + edge-weighted MSE with deep supervision (aux_weight=0.3)
+- **Radiometric jitter**: per-model channel-aware brightness/contrast perturbation (p=0.5)
+- **Directional augmentation**: aspect-aware flip/rotation for terrain-sensitive models (Hydro, Soil)
+- **Early stopping**: Halts if test loss doesn't improve for 15 epochs
+- **DistributedDataParallel**: multi-GPU support via `torchrun --distributed`
 
 See the [docs/](docs/) directory for detailed architecture documentation.
 
@@ -142,6 +143,8 @@ holdout = TemporalHoldout(train_end=18, val_end=20, test_end=23)
 pip install -r requirements.txt
 ```
 
+Core dependencies: `torch>=2.0`, `torchvision`, `timm`, `einops`, `scipy`, `numpy`, `pystac-client`, `planetary-computer`, `rasterio`, `xarray`, `zarr`, `Pillow`.
+
 ### Train All Models (Synthetic Data)
 
 ```bash
@@ -154,7 +157,7 @@ python train_models.py --model all --epochs 30
 # 1. Download curated data (30 tiles, ~1–3 hours)
 python datasets/download_real_data.py --mode curated --chips-per-tile 1000 --parallel 8
 
-# 2. (Optional) Add MSI/SMAP augmentation for Hydro/Soil targets
+# 2. Add MSI/SMAP augmentation for Hydro/Soil models
 python datasets/download_msi_smap.py
 
 # 3. (Optional) Add VIIRS fire data via bulk archive (no rate limit)
@@ -184,34 +187,36 @@ python server.py
 .
 ├── models/
 │   ├── base_model.py         # Shared ConvNeXt-V2 + UNet++ base
-│   ├── backbone.py           # ConvNeXt-V2 encoder
+│   ├── backbone.py           # ConvNeXt-V2 encoder with GRN
 │   ├── decoders.py           # UNet++ decoder + DilatedContextModule
 │   ├── fire_model.py         # FireRiskNet (7ch → impact)
 │   ├── forest_model.py       # ForestLossNet (6ch → cascade)
-│   ├── hydro_model.py        # HydroRiskNet (6ch → erosion)
-│   ├── soil_model.py         # SoilRiskNet (5ch → degradation)
+│   ├── hydro_model.py        # HydroRiskNet (7ch → erosion)
+│   ├── soil_model.py         # SoilRiskNet (7ch → degradation)
 │   ├── temporal.py           # Multi-head temporal attention
 │   └── fusion.py             # Cross-domain feature fusion
 ├── datasets/
 │   ├── real_datasets.py      # Real counterfactual datasets (sliding windows)
 │   ├── download_real_data.py # Satellite tile downloader (curated + global + VIIRS bulk)
-│   ├── download_msi_smap.py  # MSI/SMAP augmentation downloader
-│   ├── viirs_fire.py         # Synthetic fire impact data
-│   ├── hansen_gfc.py         # Synthetic cascade deforestation data
-│   ├── srtm_hydro.py         # Synthetic erosion impact data
-│   └── smap_soil.py          # Synthetic soil degradation data
+│   ├── download_msi_smap.py  # Sentinel-2 MSI + TerraClimate SMAP downloader
+│   ├── viirs_fire.py         # Synthetic fire impact data (7ch)
+│   ├── hansen_gfc.py         # Synthetic cascade deforestation data (6ch)
+│   ├── srtm_hydro.py         # Synthetic erosion impact data (7ch)
+│   └── smap_soil.py          # Synthetic soil degradation data (7ch)
 ├── weights/                  # Trained model checkpoints
 ├── docs/                     # Architecture documentation
 │   └── TrainingRunbook.md    # A100 training guide
+├── tests/
+│   └── test_pipeline_unit.py # 77 unit tests covering full pipeline
 ├── static/                   # Web UI assets
-├── losses.py                 # Loss functions (EdgeWeightedMSE, SmoothMSE, etc.)
+├── losses.py                 # Loss functions (Focal Charbonnier + SSIM + EdgeWeightedMSE)
 ├── uncertainty.py            # MC Dropout uncertainty quantification
 ├── explainability.py         # GradCAM attribution maps
 ├── validation.py             # Spatial cross-validation & temporal holdout
 ├── aggregator.py             # Hybrid impact fusion module
 ├── env.py                    # Gymnasium RL environment
 ├── impact.py                 # Cascading impact propagation (D8 routing)
-├── evaluate_models.py        # Post-training model evaluation
+├── evaluate_models.py        # Post-training model evaluation with TTA
 ├── train_models.py           # Domain model training (synthetic)
 ├── train_real_models.py      # Domain model training (real satellite)
 ├── server.py                 # Flask web server

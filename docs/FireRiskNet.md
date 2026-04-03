@@ -50,16 +50,16 @@ Fire impact delta: increase in fire activity in surrounding forest **caused by**
 
 ## Loss Function
 
-**CounterfactualDeltaLoss** — wraps Edge-Weighted MSE (3× upweight near deforestation edges + gradient matching) with a monotonicity penalty ensuring counterfactual output ≥ factual output. Combined with UNet++ deep supervision (aux_weight=0.3).
+**CounterfactualDeltaLoss** — wraps a composite loss (Focal Charbonnier ε=1e-6, γ=2.0 + SSIM + edge-weighted MSE with 3× deforestation edge upweight) with a monotonicity penalty ensuring counterfactual output ≥ factual output. Combined with UNet++ deep supervision (aux_weight=0.3).
 
 ## Training
 
 - **Siamese counterfactual**: paired forward pass (factual vs counterfactual) with shared weights
 - **Spatial-only split**: 80% train tiles / 20% test+validate tiles, all years 1–23
-- **Data augmentation**: random flips + 90° rotations + RadiometricJitter (brightness/contrast p=0.5)
-- **Optimizer**: AdamW (lr=3e-4, weight_decay=0.01)
-- **Scheduler**: 10% linear warmup → cosine annealing
+- **Data augmentation**: random flips + 90° rotations + RadiometricJitter on channel [0] (brightness/contrast p=0.5)
+- **Optimizer**: AdamW (lr=3e-4, weight_decay=0.01) with decay-group exclusions for bias/norm layers
+- **Scheduler**: 10% linear warmup → cosine annealing (min_lr floor)
 - **Gradient accumulation**: 4× steps (effective batch = 64 on A100)
-- **Deep supervision**: UNet++ auxiliary losses (weight=0.3)
-- **Early stopping**: patience=10
+- **Deep supervision**: UNet++ auxiliary losses (weight=0.3), full-resolution re-computation
+- **Early stopping**: patience=15
 - **AMP**: enabled on CUDA
