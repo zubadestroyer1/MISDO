@@ -9,28 +9,11 @@ Prioritised list of improvements to increase model accuracy and robustness.
 ### 1. Activate Monotonicity Penalty
 The `CounterfactualDeltaLoss` has a built-in penalty ensuring counterfactual output ≥ factual output (deforestation shouldn't decrease risk). Currently dead code — factual/counterfactual raw outputs are never passed to the loss.
 
-### 2. Replace Hydro Proxy Targets with Real Observations
-**Current:** Hydro target is a deterministic formula (`exposed × slope × curvature × flow_acc`) — the model learns to replicate a hand-coded equation, not real-world erosion.
+### 2. ~~Replace Hydro Proxy Targets with Real Observations~~ ✔ (Fixed)
+~~**Current:** Hydro target is a deterministic formula...~~ Implemented Sentinel-2 NDSSI. The pipeline now fetches real pre/post deforestation MSI data to compute the NDSSI delta.
 
-**Proposed:** Use **Landsat-derived NDVI change in riparian zones** as a real observation target:
-- Landsat 5/7/8/9 (30m resolution) — perfect spatial match with Hansen chips
-- Detect riparian vegetation loss downstream of deforestation events
-- NDVI is a direct spectral product (no atmospheric correction needed)
-- Available 1985–present with 16-day revisit
-
-**Alternative (harder):** Landsat water turbidity via Normalized Difference Turbidity Index (NDTI), requiring water pixel detection, atmospheric correction, cloud masking, and watershed delineation. ~1-2 weeks effort.
-
-### 3. Replace Soil Proxy Targets with SMAP Observations
-**Current:** Soil target is `Σ(deforested × slope × years_since)` — a physics formula with no observational validation.
-
-**Proposed:** Use **NASA SMAP L3/L4 soil moisture** as a real observation target:
-- Free via NASA Earthdata (`earthaccess` Python package)
-- L4 downscaled to 1km resolution (each 256×256 chip ≈ 1 SMAP pixel)
-- Available 2015–present (daily)
-- Frame as: `target = moisture_after_clearing - moisture_before_clearing`
-- ~2-3 days integration effort
-
-**Limitation:** Coarse resolution means chip-level scalar targets, not pixel-level maps. Could combine with DEM-derived susceptibility for spatial detail.
+### 3. ~~Replace Soil Proxy Targets with SMAP Observations~~ ✔ (Fixed)
+~~**Current:** Soil target is a physics formula...~~ Implemented TerraClimate soil moisture. The pipeline now fetches actual soil moisture data to weight the physically-modelled degradation.
 
 ### 4. ~~Add Data Quality Checks~~ ✔ (Fixed)
 ~~No validation at load time for all-zero chips, NaN/Inf values, missing keys, or corrupted `.npz` files. Any of these silently corrupt training.~~ Implemented via `validate_chip()` in `real_datasets.py` — validates every chip at `__getitem__` time with retry on failure.

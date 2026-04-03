@@ -57,19 +57,19 @@ def main() -> None:
         print("  Proceeding with random-init models for structural test...\n")
 
     # ─── Step 1: Generate domain data ────────────────────────────────────
-    print("\n[1/5] Generating domain-specific synthetic data ...")
+    print("\n[1/6] Generating domain-specific synthetic data ...")
     t0 = time.time()
 
     datasets_info = {
         "fire": {"class": VIIRSFireDataset, "channels": 7},
         "forest": {"class": HansenGFCDataset, "channels": 6},
-        "hydro": {"class": SRTMHydroDataset, "channels": 6},
-        "soil": {"class": SMAPSoilDataset, "channels": 5},
+        "hydro": {"class": SRTMHydroDataset, "channels": 7},
+        "soil": {"class": SMAPSoilDataset, "channels": 7},
     }
 
     domain_inputs = {}
     for name, info in datasets_info.items():
-        ds = info["class"](num_samples=1, spatial_size=256, seed=42)
+        ds = info["class"](num_samples=1, image_size=256, seed=42)
         obs, target = ds[0]
         domain_inputs[name] = obs.unsqueeze(0).to(device)
         print(f"  {name:8s}: obs {obs.shape}  "
@@ -79,7 +79,7 @@ def main() -> None:
     print(f"  Data generation: {time.time() - t0:.2f}s")
 
     # ─── Step 2: Load and run each model ─────────────────────────────────
-    print("\n[2/5] Running domain-specific models ...")
+    print("\n[2/6] Running domain-specific models ...")
     t0 = time.time()
 
     model_classes = {
@@ -127,7 +127,7 @@ def main() -> None:
     print(f"  Inference time: {time.time() - t0:.2f}s")
 
     # ─── Step 3: Aggregator ──────────────────────────────────────────────
-    print("\n[3/5] Running conditioned aggregator ...")
+    print("\n[3/6] Running conditioned aggregator ...")
     t0 = time.time()
 
     aggregator = ConditionedAggregator().to(device)
@@ -142,9 +142,9 @@ def main() -> None:
     }
 
     # Extract hard-constraint data from the real SRTM hydro domain
-    # SRTMHydroDataset channels (6): 0=elevation, 1=slope, 2=aspect,
-    # 3=flow_acc, 4=cleared_forest, 5=deforestation_mask
-    hydro_tensor = domain_inputs["hydro"]  # [1, 6, 256, 256]
+    # SRTMHydroDataset channels (7): 0=elevation, 1=slope, 2=aspect,
+    # 3=flow_acc, 4=cleared_forest, 5=ndssi_baseline, 6=deforestation_mask
+    hydro_tensor = domain_inputs["hydro"]  # [1, 7, 256, 256]
     slope_tensor = hydro_tensor[:, 1:2, :, :]     # [1, 1, 256, 256]  (slope)
     river_tensor = hydro_tensor[:, 3:4, :, :]     # [1, 1, 256, 256]  (flow_acc proxy)
 
@@ -166,7 +166,7 @@ def main() -> None:
     print(f"  Aggregation time: {time.time() - t0:.2f}s")
 
     # ─── Step 4: RL Environment ──────────────────────────────────────────
-    print("\n[4/5] Running RL environment test (balanced weights) ...")
+    print("\n[4/6] Running RL environment test (balanced weights) ...")
     t0 = time.time()
 
     harm_mask_np = harm_masks["balanced"]
@@ -250,7 +250,6 @@ def main() -> None:
     print(f"  Siamese test time: {time.time() - t0:.2f}s")
 
     # ─── Step 6: Summary ─────────────────────────────────────────────────
-    from data import MockEODataset
     print(f"\n{'=' * 70}")
     print(f"  TEST RESULTS SUMMARY")
     print(f"{'=' * 70}")

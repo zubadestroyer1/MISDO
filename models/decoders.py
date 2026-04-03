@@ -254,17 +254,45 @@ class UNetPPDecoder(nn.Module):
         self.head = nn.Conv2d(d // 4, 1, kernel_size=1)
 
         # Deep supervision heads (predict at X_{0,1}, X_{0,2}, X_{1,2})
+        #
+        # Resolution-aware upsampling:
+        #   x01, x02 are at depth 0 → H/4  → need 4× upsample (2 stages)
+        #   x12      is at depth 1 → H/8  → need 8× upsample (3 stages)
         if deep_supervision:
+            # Row-0 heads: 4× upsample (H/4 → H)
+            _ds_head_row0 = nn.Sequential(
+                _BilinearUp2x(),
+                nn.Conv2d(d, d // 2, 3, padding=1, bias=False),
+                nn.GroupNorm(min(16, d // 2), d // 2),
+                nn.GELU(),
+                _BilinearUp2x(),
+                nn.Conv2d(d // 2, 1, 1),
+            )
+            _ds_head_row0b = nn.Sequential(
+                _BilinearUp2x(),
+                nn.Conv2d(d, d // 2, 3, padding=1, bias=False),
+                nn.GroupNorm(min(16, d // 2), d // 2),
+                nn.GELU(),
+                _BilinearUp2x(),
+                nn.Conv2d(d // 2, 1, 1),
+            )
+            # Row-1 head: 8× upsample (H/8 → H)
+            _ds_head_row1 = nn.Sequential(
+                _BilinearUp2x(),
+                nn.Conv2d(d, d // 2, 3, padding=1, bias=False),
+                nn.GroupNorm(min(16, d // 2), d // 2),
+                nn.GELU(),
+                _BilinearUp2x(),
+                nn.Conv2d(d // 2, d // 4, 3, padding=1, bias=False),
+                nn.GroupNorm(min(8, d // 4), d // 4),
+                nn.GELU(),
+                _BilinearUp2x(),
+                nn.Conv2d(d // 4, 1, 1),
+            )
             self.ds_heads = nn.ModuleList([
-                nn.Sequential(
-                    _BilinearUp2x(),
-                    nn.Conv2d(d, d // 2, 3, padding=1, bias=False),
-                    nn.GroupNorm(min(16, d // 2), d // 2),
-                    nn.GELU(),
-                    _BilinearUp2x(),
-                    nn.Conv2d(d // 2, 1, 1),
-                )
-                for _ in range(3)
+                _ds_head_row0,
+                _ds_head_row0b,
+                _ds_head_row1,
             ])
 
     def forward(

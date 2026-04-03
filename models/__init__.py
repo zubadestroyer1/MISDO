@@ -10,8 +10,8 @@ UNet++ decoder and nested dense skip connections.
 Models:
     FireRiskNet    — VIIRS active-fire detection      (7 input channels, ~28M params)
     ForestLossNet  — Hansen deforestation detection    (6 input channels, ~28M params)
-    HydroRiskNet   — SRTM/HydroSHEDS water-pollution  (6 input channels, ~28M params)
-    SoilRiskNet    — SMAP soil degradation             (5 input channels, ~28M params)
+    HydroRiskNet   — SRTM/HydroSHEDS water-pollution  (7 input channels, ~28M params)
+    SoilRiskNet    — SMAP soil degradation             (7 input channels, ~28M params)
 """
 
 from __future__ import annotations

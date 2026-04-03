@@ -6,13 +6,20 @@ All loss functions include numerical safety guards (prediction clamping,
 epsilon-protected divisions) to prevent NaN under mixed-precision training.
 
 Loss Functions:
-    FocalBCELoss    — Focal-weighted binary cross-entropy for sparse events (fire, forest loss)
-    DiceBCELoss     — Combined Dice + BCE for segmentation with fragmented patches
-    GradientMSELoss — MSE + gradient-matching regulariser for spatially smooth risk surfaces
-    SmoothMSELoss   — MSE + spatial gradient-matching + Pearson correlation reward
+    FocalBCELoss            — Focal-weighted binary cross-entropy for sparse events
+    DiceBCELoss             — Combined Dice + BCE for fragmented segmentation
+    GradientMSELoss         — MSE + gradient-matching regulariser for smooth risk surfaces
+    SmoothMSELoss           — MSE + gradient-matching + Pearson correlation reward
+    SSIMLoss                — Differentiable Structural Similarity Index loss
+    EdgeWeightedMSELoss     — Charbonnier + SSIM + edge upweighting + gradient matching
+    CounterfactualDeltaLoss — Main training loss: EdgeWeightedMSE on delta + monotonicity penalty
+    DeepSupervisionWrapper  — Wraps any loss to add auxiliary losses from UNet++ nodes
 
 Usage:
-    from losses import FocalBCELoss, DiceBCELoss, GradientMSELoss, SmoothMSELoss
+    from losses import (
+        CounterfactualDeltaLoss, DeepSupervisionWrapper, EdgeWeightedMSELoss,
+        FocalBCELoss, DiceBCELoss, GradientMSELoss, SmoothMSELoss, SSIMLoss,
+    )
 """
 
 from __future__ import annotations
@@ -25,6 +32,12 @@ from torch import Tensor
 
 # Numerical safety constant — prevents log(0) in BCE
 _EPS: float = 1e-7
+
+# Charbonnier epsilon — controls the L1/L2 transition point.
+# At ε = 1e-3, errors > ~0.001 get near-L1 gradient (outlier-robust),
+# while errors < ~0.001 get smooth L2 gradient (stable near zero).
+# This is standard in image super-resolution (EDSR, SRResNet).
+_CHARB_EPS: float = 1e-3
 
 
 class FocalBCELoss(nn.Module):
@@ -57,7 +70,11 @@ class FocalBCELoss(nn.Module):
         pred = pred.clamp(_EPS, 1.0 - _EPS)
         bce = F.binary_cross_entropy(pred, target, reduction="none")
         p_t = pred * target + (1.0 - pred) * (1.0 - target)
-        focal_weight = self.alpha * (1.0 - p_t) ** self.gamma
+        # Per-class alpha weighting (Lin et al. 2017): alpha for positives,
+        # (1 - alpha) for negatives.  With alpha=0.75 this gives a 3:1
+        # positive-to-negative weight ratio to counteract class imbalance.
+        alpha_t = self.alpha * target + (1.0 - self.alpha) * (1.0 - target)
+        focal_weight = alpha_t * (1.0 - p_t) ** self.gamma
         return (focal_weight * bce).mean()
 
 
@@ -182,12 +199,123 @@ class SmoothMSELoss(nn.Module):
         return mse + self.grad_weight * grad_loss + self.corr_weight * corr_loss
 
 
-class EdgeWeightedMSELoss(nn.Module):
-    """MSE + gradient-matching with upweighting near deforestation edges.
+# ═══════════════════════════════════════════════════════════════════════════
+# SSIM — Structural Similarity Index
+# ═══════════════════════════════════════════════════════════════════════════
 
-    For counterfactual impact prediction, the strongest signal is in
-    pixels immediately surrounding cleared areas.  This loss upweights
-    those pixels to focus learning on the high-impact zone.
+def _gaussian_kernel_2d(kernel_size: int = 11, sigma: float = 1.5) -> Tensor:
+    """Create a 2D Gaussian kernel for SSIM computation.
+
+    Returns a normalised [1, 1, K, K] kernel suitable for F.conv2d.
+    The separable construction (outer product of 1-D Gaussians) is
+    mathematically identical to a direct 2-D Gaussian but numerically
+    cleaner for small kernels.
+    """
+    coords = torch.arange(kernel_size, dtype=torch.float32) - kernel_size // 2
+    g1d = torch.exp(-coords ** 2 / (2.0 * sigma ** 2))
+    g2d = g1d.unsqueeze(1) * g1d.unsqueeze(0)  # outer product
+    g2d = g2d / g2d.sum()  # normalise to sum=1
+    return g2d.unsqueeze(0).unsqueeze(0)  # [1, 1, K, K]
+
+
+class SSIMLoss(nn.Module):
+    """Differentiable Structural Similarity Index (SSIM) loss.
+
+    Measures local luminance, contrast, and structural correlation
+    between prediction and target using Gaussian-weighted sliding
+    windows.  Returns ``1 - mean(SSIM_map)`` so that lower = better.
+
+    Implemented from scratch with pure PyTorch — no external
+    dependencies.  Numerically safe under AMP (float16) via epsilon
+    guards in the denominator.
+
+    Reference:
+        Wang et al., "Image Quality Assessment: From Error Visibility
+        to Structural Similarity", IEEE TIP 2004.
+
+    Parameters
+    ----------
+    kernel_size : int
+        Size of the Gaussian sliding window (default 11).
+    sigma : float
+        Standard deviation of the Gaussian kernel (default 1.5).
+    data_range : float
+        Dynamic range of the input (default 1.0 for [0, 1] data).
+    """
+
+    def __init__(
+        self,
+        kernel_size: int = 11,
+        sigma: float = 1.5,
+        data_range: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.data_range = data_range
+
+        # Stability constants (Wang et al. 2004)
+        self.C1 = (0.01 * data_range) ** 2  # 1e-4 for range=1.0
+        self.C2 = (0.03 * data_range) ** 2  # 9e-4 for range=1.0
+
+        # Register the Gaussian kernel as a persistent buffer so it
+        # moves to the correct device/dtype with the module.
+        kernel = _gaussian_kernel_2d(kernel_size, sigma)
+        self.register_buffer("_kernel", kernel)
+
+    def _ssim_map(self, pred: Tensor, target: Tensor) -> Tensor:
+        """Compute per-pixel SSIM map (values in [-1, 1])."""
+        pad = self.kernel_size // 2
+        C = pred.shape[1]  # number of channels (typically 1)
+
+        # Expand kernel to match input channels (groups=C for depthwise conv)
+        # Cast to input dtype for AMP float16 compatibility — the registered
+        # buffer is float32 but inputs may arrive as float16 under autocast.
+        kernel = self._kernel.to(dtype=pred.dtype).expand(C, 1, -1, -1)
+
+        # Local means via Gaussian-weighted convolution
+        mu_p = F.conv2d(pred, kernel, padding=pad, groups=C)
+        mu_t = F.conv2d(target, kernel, padding=pad, groups=C)
+
+        mu_p_sq = mu_p * mu_p
+        mu_t_sq = mu_t * mu_t
+        mu_pt = mu_p * mu_t
+
+        # Local variances and covariance
+        # Var(X) = E[X²] - E[X]²  via the Gaussian-weighted window
+        sigma_p_sq = F.conv2d(pred * pred, kernel, padding=pad, groups=C) - mu_p_sq
+        sigma_t_sq = F.conv2d(target * target, kernel, padding=pad, groups=C) - mu_t_sq
+        sigma_pt = F.conv2d(pred * target, kernel, padding=pad, groups=C) - mu_pt
+
+        # Clamp variances to zero (numerical noise can make them slightly negative)
+        sigma_p_sq = sigma_p_sq.clamp(min=0.0)
+        sigma_t_sq = sigma_t_sq.clamp(min=0.0)
+
+        # SSIM formula (Wang et al. 2004, Eq. 13)
+        numerator = (2.0 * mu_pt + self.C1) * (2.0 * sigma_pt + self.C2)
+        denominator = (mu_p_sq + mu_t_sq + self.C1) * (sigma_p_sq + sigma_t_sq + self.C2)
+
+        return numerator / denominator
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        """Compute SSIM loss = 1 - mean(SSIM_map)."""
+        ssim_map = self._ssim_map(pred, target)
+        return 1.0 - ssim_map.mean()
+
+
+class EdgeWeightedMSELoss(nn.Module):
+    """Charbonnier + SSIM + gradient-matching with edge upweighting.
+
+    The primary loss for counterfactual impact prediction.  Combines:
+
+    1. **Charbonnier pixel-wise loss** (√(error² + ε²)) — more robust
+       to outliers than MSE, produces sharper edges on sparse targets.
+       Standard in image super-resolution (EDSR, SRResNet, SwinIR).
+    2. **SSIM structural similarity** — captures local luminance,
+       contrast, and structure correlation in sliding windows.
+    3. **Edge upweighting** — 3–5× weight on pixels near deforestation
+       boundaries where the impact signal is strongest.
+    4. **Gradient matching** — penalises differences in spatial gradients
+       to encourage correct spatial patterns.
 
     Parameters
     ----------
@@ -199,8 +327,16 @@ class EdgeWeightedMSELoss(nn.Module):
         ~150 m at 30 m resolution).
     grad_weight : float
         Weight of the gradient-matching term (default 0.2).
+    ssim_weight : float
+        Weight of the SSIM structural similarity term (default 0.1).
     base_weight : float
         Weight for non-edge pixels (default 1.0).
+    charb_eps : float
+        Charbonnier epsilon controlling L1/L2 transition (default 1e-3).
+    focal_gamma : float
+        Focal exponent for down-weighting easy background pixels.
+        Higher values push more gradient budget toward hard impact-zone
+        pixels where the model most needs to learn (default 2.0).
     """
 
     def __init__(
@@ -208,16 +344,28 @@ class EdgeWeightedMSELoss(nn.Module):
         edge_weight: float = 3.0,
         edge_radius: int = 5,
         grad_weight: float = 0.2,
+        ssim_weight: float = 0.1,
         base_weight: float = 1.0,
+        charb_eps: float = _CHARB_EPS,
+        focal_gamma: float = 2.0,
     ) -> None:
         super().__init__()
         self.edge_weight = edge_weight
         self.edge_radius = edge_radius
         self.grad_weight = grad_weight
+        self.ssim_weight = ssim_weight
         self.base_weight = base_weight
+        self.charb_eps = charb_eps
+        self.focal_gamma = focal_gamma
 
-        # Dilation kernel for edge detection (3×3 max pool approximates dilation)
+        # Dilation kernel for edge detection (max pool approximates dilation)
         self._kernel_size = 2 * edge_radius + 1
+
+        # SSIM module for structural similarity (only created if weight > 0)
+        if ssim_weight > 0:
+            self.ssim_loss = SSIMLoss(kernel_size=11, sigma=1.5, data_range=1.0)
+        else:
+            self.ssim_loss = None
 
     def _compute_edge_mask(self, target: Tensor) -> Tensor:
         """Compute a weight mask that upweights pixels near non-zero target regions.
@@ -250,18 +398,47 @@ class EdgeWeightedMSELoss(nn.Module):
         return weight_map
 
     def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        # Weighted MSE
+        # ── Weighted Charbonnier loss ──
+        # Charbonnier: sqrt((pred - target)² + ε²)
+        # Behaves like L2 for small errors (smooth gradient at zero),
+        # and like L1 for large errors (robust to outliers, sharper edges).
         weight_map = self._compute_edge_mask(target)
-        mse = (weight_map * (pred - target) ** 2).mean()
+        error_sq = (pred - target) ** 2
+        charbonnier = torch.sqrt(error_sq + self.charb_eps ** 2)
 
-        # Gradient matching
+        # Focal modulation: down-weight easy background pixels.
+        # For target≈0, pred≈0 pixels: focal_mod → 1^γ → 1 (no change)
+        # would naively be strongest. Instead, we use target magnitude
+        # as the "easy" indicator: pixels with higher target signal
+        # get full weight, while background pixels (target≈0) that the
+        # model already predicts correctly get reduced weight.
+        # focal_mod = (target + ε)^γ ensures impact-zone pixels get
+        # full gradient while zero-background pixels get scaled down.
+        if self.focal_gamma > 0:
+            # Scale between [ε^γ, 1.0] — impact pixels get ~1.0
+            focal_mod = (target.clamp(0, 1) + 1e-6) ** self.focal_gamma
+            # Normalise so the max modulator is 1.0
+            focal_mod = focal_mod / (focal_mod.max() + 1e-8)
+            # Ensure minimum weight so background still contributes
+            focal_mod = focal_mod.clamp(min=0.05)
+            pixel_loss = (weight_map * focal_mod * charbonnier).mean()
+        else:
+            pixel_loss = (weight_map * charbonnier).mean()
+
+        # ── SSIM structural similarity ──
+        if self.ssim_loss is not None:
+            ssim_term = self.ssim_loss(pred, target)
+        else:
+            ssim_term = 0.0
+
+        # ── Gradient matching ──
         pred_dy = pred[:, :, 1:, :] - pred[:, :, :-1, :]
         pred_dx = pred[:, :, :, 1:] - pred[:, :, :, :-1]
         tgt_dy = target[:, :, 1:, :] - target[:, :, :-1, :]
         tgt_dx = target[:, :, :, 1:] - target[:, :, :, :-1]
         grad_loss = F.mse_loss(pred_dy, tgt_dy) + F.mse_loss(pred_dx, tgt_dx)
 
-        return mse + self.grad_weight * grad_loss
+        return pixel_loss + self.ssim_weight * ssim_term + self.grad_weight * grad_loss
 
 
 class DeepSupervisionWrapper(nn.Module):
@@ -298,16 +475,22 @@ class DeepSupervisionWrapper(nn.Module):
         if deep_outputs is None or len(deep_outputs) == 0:
             return main_loss
 
-        # Auxiliary losses — resize target to match each auxiliary output
+        # Auxiliary losses — resize target to match each auxiliary output.
         # Note: kwargs (out_factual etc.) are NOT passed to auxiliaries —
         # monotonicity is only enforced on the main output.
+        #
+        # We use nearest-neighbor interpolation for downscaling so that
+        # sparse signal pixels (target > 0.01) retain their values exactly
+        # rather than being blurred below the EdgeWeightedMSELoss threshold
+        # by bilinear averaging.  This preserves edge-mask quality at lower
+        # auxiliary resolutions.
         aux_total = torch.zeros(1, device=pred.device, dtype=pred.dtype)
         for aux_pred in deep_outputs:
             if aux_pred.shape != target.shape:
                 # Deep supervision outputs may be at a different resolution
                 target_resized = F.interpolate(
                     target, size=aux_pred.shape[2:],
-                    mode="bilinear", align_corners=False,
+                    mode="nearest",
                 )
             else:
                 target_resized = target
@@ -384,6 +567,7 @@ LOSS_REGISTRY = {
     "dice_bce": DiceBCELoss,
     "gradient_mse": GradientMSELoss,
     "smooth_mse": SmoothMSELoss,
+    "ssim": SSIMLoss,
     "edge_weighted_mse": EdgeWeightedMSELoss,
     "counterfactual_delta": CounterfactualDeltaLoss,
 }
@@ -404,7 +588,7 @@ if __name__ == "__main__":
         loss = loss_fn(pred, target)
         assert not torch.isnan(loss), f"NaN in {name}!"
         assert not torch.isinf(loss), f"Inf in {name}!"
-        print(f"  {name:15s}: {loss.item():.6f}")
+        print(f"  {name:20s}: {loss.item():.6f}")
 
     # Test edge case: all-zero predictions (AMP worst case)
     print("\nEdge case — near-zero predictions:")
@@ -413,7 +597,7 @@ if __name__ == "__main__":
         loss_fn = LossClass()
         loss = loss_fn(pred_zero, target)
         assert not torch.isnan(loss), f"NaN in {name} with zero preds!"
-        print(f"  {name:15s}: {loss.item():.6f}")
+        print(f"  {name:20s}: {loss.item():.6f}")
 
     # Test edge case: all-one predictions
     print("\nEdge case — near-one predictions:")
@@ -422,10 +606,46 @@ if __name__ == "__main__":
         loss_fn = LossClass()
         loss = loss_fn(pred_one, target)
         assert not torch.isnan(loss), f"NaN in {name} with one preds!"
-        print(f"  {name:15s}: {loss.item():.6f}")
+        print(f"  {name:20s}: {loss.item():.6f}")
 
-    # Test DeepSupervisionWrapper
-    print("\nDeepSupervisionWrapper test:")
+    # ── SSIM correctness tests ──
+    print("\n── SSIM correctness tests ──")
+    ssim = SSIMLoss()
+    # Perfect match → SSIM = 1.0, loss = 0.0
+    ssim_perfect = ssim(pred, pred)
+    assert abs(ssim_perfect.item()) < 1e-5, (
+        f"SSIM(pred, pred) should be ~0, got {ssim_perfect.item():.6f}"
+    )
+    print(f"  SSIM(pred, pred):   {ssim_perfect.item():.6f}  (expected ~0.0)")
+    # Random pair → SSIM ≈ 0, loss ≈ 1.0
+    pred2 = torch.sigmoid(torch.randn(2, 1, 64, 64))
+    ssim_random = ssim(pred, pred2)
+    assert ssim_random.item() > 0.3, (
+        f"SSIM(pred, random) should be large, got {ssim_random.item():.6f}"
+    )
+    print(f"  SSIM(pred, random): {ssim_random.item():.6f}  (expected ~0.5–1.0)")
+    # All zeros → should not NaN
+    ssim_zero = ssim(pred_zero, pred_zero)
+    assert not torch.isnan(ssim_zero), "SSIM NaN on zero inputs!"
+    print(f"  SSIM(zero, zero):   {ssim_zero.item():.6f}  (expected ~0.0)")
+
+    # ── Charbonnier vs MSE comparison ──
+    print("\n── Charbonnier behaviour test ──")
+    ew = EdgeWeightedMSELoss(ssim_weight=0.0)  # Charbonnier only, no SSIM
+    loss_charb = ew(pred, target)
+    assert not torch.isnan(loss_charb), "NaN in Charbonnier!"
+    print(f"  EdgeWeightedMSE (Charbonnier, no SSIM): {loss_charb.item():.6f}")
+    ew_ssim = EdgeWeightedMSELoss(ssim_weight=0.1)
+    loss_charb_ssim = ew_ssim(pred, target)
+    assert not torch.isnan(loss_charb_ssim), "NaN in Charbonnier+SSIM!"
+    print(f"  EdgeWeightedMSE (Charbonnier + SSIM):   {loss_charb_ssim.item():.6f}")
+    # SSIM component should add to the loss
+    assert loss_charb_ssim > loss_charb, (
+        "Adding SSIM should increase loss (structural imperfection adds penalty)"
+    )
+
+    # ── DeepSupervisionWrapper test ──
+    print("\nDeepSupervisionWrapper test (FocalBCE):")
     base = FocalBCELoss()
     ds_loss = DeepSupervisionWrapper(base, aux_weight=0.3)
     deep = [torch.sigmoid(torch.randn(2, 1, 32, 32)) for _ in range(3)]
@@ -434,5 +654,52 @@ if __name__ == "__main__":
     print(f"  With deep supervision: {loss.item():.6f}")
     loss_no_ds = ds_loss(pred, target, None)
     print(f"  Without deep supervision: {loss_no_ds.item():.6f}")
+
+    # ── CounterfactualDeltaLoss monotonicity test ──
+    print("\nCounterfactualDeltaLoss monotonicity test:")
+    cf_loss = CounterfactualDeltaLoss()
+    out_f = torch.sigmoid(torch.randn(2, 1, 64, 64))
+    out_cf = torch.sigmoid(torch.randn(2, 1, 64, 64))
+    loss_mono = cf_loss(pred, target, out_factual=out_f, out_counterfactual=out_cf)
+    assert not torch.isnan(loss_mono), "NaN in CounterfactualDeltaLoss with monotonicity!"
+    loss_no_mono = cf_loss(pred, target)
+    assert not torch.isnan(loss_no_mono), "NaN in CounterfactualDeltaLoss without monotonicity!"
+    print(f"  With monotonicity penalty:    {loss_mono.item():.6f}")
+    print(f"  Without monotonicity penalty: {loss_no_mono.item():.6f}")
+    assert loss_mono >= loss_no_mono, "Monotonicity penalty should increase loss!"
+
+    # ── Production combination: DS + CounterfactualDelta + EdgeWeightedMSE ──
+    print("\nProduction loss combination test (DS + CounterfactualDelta):")
+    cf_base = CounterfactualDeltaLoss(
+        base_loss=EdgeWeightedMSELoss(edge_weight=5.0, ssim_weight=0.15),
+    )
+    ds_cf = DeepSupervisionWrapper(cf_base, aux_weight=0.3)
+    deep_deltas = [torch.sigmoid(torch.randn(2, 1, 32, 32)) for _ in range(3)]
+    loss_prod = ds_cf(
+        pred, target, deep_deltas,
+        out_factual=out_f, out_counterfactual=out_cf,
+    )
+    assert not torch.isnan(loss_prod), "NaN in production loss combination!"
+    print(f"  Full production loss (fire-like config): {loss_prod.item():.6f}")
+    loss_prod_no_aux = ds_cf(
+        pred, target, None,
+        out_factual=out_f, out_counterfactual=out_cf,
+    )
+    print(f"  Without deep supervision: {loss_prod_no_aux.item():.6f}")
+
+    # ── AMP float16 stability test ──
+    print("\n── AMP float16 stability test ──")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+    pred_f16 = pred.to(device).half()
+    target_f16 = target.to(device).half()
+    for name, LossClass in LOSS_REGISTRY.items():
+        loss_fn = LossClass().to(device)
+        loss = loss_fn(pred_f16, target_f16)
+        assert not torch.isnan(loss), f"NaN in {name} under float16!"
+        assert not torch.isinf(loss), f"Inf in {name} under float16!"
+        print(f"  {name:20s}: {loss.item():.6f} (float16)")
 
     print("\n✓ All loss function tests passed")

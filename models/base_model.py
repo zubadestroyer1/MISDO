@@ -46,6 +46,7 @@ class DomainRiskNet(nn.Module):
     """
 
     IN_CHANNELS: int  # must be set by subclass
+    TEMPORAL: bool = True  # subclasses can set False to skip temporal modules
     BOTTLENECK_CHANNELS: int = _DIMS[-1]  # 768
 
     def __init__(self, in_channels: int | None = None) -> None:
@@ -58,18 +59,19 @@ class DomainRiskNet(nn.Module):
             dims=_DIMS,
             depths=_DEPTHS,
             drop_path_rate=0.1,
+            pretrained=True,
         )
 
-        # ── Temporal Attention (bottleneck) ──
-        self.temporal_attn = TemporalAttention(_DIMS[-1])
-
-        # ── Temporal Skip Fusion (skip connections) ──
-        # Learns temporal weights for each skip scale instead of using
-        # only the last timestep
-        self.skip_temporal = nn.ModuleDict({
-            f"s{i+1}": TemporalSkipFusion(channels=_DIMS[i])
-            for i in range(3)  # s1, s2, s3 (s4 is handled by temporal_attn)
-        })
+        # ── Temporal modules (only when needed) ──
+        if self.TEMPORAL:
+            self.temporal_attn = TemporalAttention(_DIMS[-1])
+            self.skip_temporal = nn.ModuleDict({
+                f"s{i+1}": TemporalSkipFusion(channels=_DIMS[i])
+                for i in range(3)  # s1, s2, s3 (s4 is handled by temporal_attn)
+            })
+        else:
+            self.temporal_attn = None
+            self.skip_temporal = None
 
         # ── Decoder ──
         self.decoder = UNetPPDecoder(
@@ -103,6 +105,11 @@ class DomainRiskNet(nn.Module):
         skips : dict with keys 's1', 's2', 's3'
         """
         if x.dim() == 5:
+            if self.temporal_attn is None:
+                raise ValueError(
+                    f"{self.__class__.__name__} received 5D temporal input "
+                    f"but TEMPORAL=False. Use [B, C, H, W] input instead."
+                )
             B, T, C, H, W = x.shape
             x_flat = x.view(B * T, C, H, W)
             b_all, skips_all = self._run_encoder(x_flat)
@@ -132,7 +139,27 @@ class DomainRiskNet(nn.Module):
         }
         return self.decoder(features)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(
+        self, x: Tensor, x_counterfactual: Tensor | None = None,
+    ) -> Tensor | Tuple[Tensor, list, Tensor, Tensor]:
+        """Forward pass — supports both single-input and Siamese paired modes.
+
+        When ``x_counterfactual`` is provided, dispatches to
+        ``forward_paired_deep`` which returns the full 4-tuple needed
+        for training (delta, deep_deltas, out_f, out_cf).  This allows
+        ``DataParallel``/``DistributedDataParallel`` wrappers (which only
+        parallelise ``.forward()``) to properly split both inputs across
+        GPUs.
+
+        Parameters
+        ----------
+        x : Tensor
+            Factual observation (or single input for non-Siamese mode).
+        x_counterfactual : Tensor | None
+            If provided, counterfactual observation for Siamese paired forward.
+        """
+        if x_counterfactual is not None:
+            return self.forward_paired_deep(x, x_counterfactual)
         bottleneck, skips = self.encode(x)
         return self.decode(bottleneck, skips)
 
@@ -170,17 +197,16 @@ class DomainRiskNet(nn.Module):
     ) -> Tuple[Tensor, list, Tensor, Tensor]:
         """Paired forward with deep supervision outputs for training.
 
-        Decodes each branch independently and computes delta in output
-        space.  Deep supervision outputs come from the counterfactual
-        branch (the branch with deforestation signal) to provide
-        auxiliary gradient signal at multiple decoder depths.
+        Both branches are decoded with deep supervision so that
+        auxiliary deltas are computed at matched abstraction levels
+        (aux_cf[i] - aux_f[i]), not from mismatched representations.
 
         Returns
         -------
         impact_delta : Tensor [B, 1, H, W]
             Clamped delta prediction.
-        deep_outputs : list[Tensor]
-            Auxiliary deep supervision outputs from counterfactual branch.
+        deep_deltas : list[Tensor]
+            Auxiliary deltas from matched intermediate decoder nodes.
         out_factual : Tensor [B, 1, H, W]
             Raw decoded factual output (for monotonicity penalty).
         out_counterfactual : Tensor [B, 1, H, W]
@@ -189,37 +215,40 @@ class DomainRiskNet(nn.Module):
         b_f, s_f = self.encode(x_factual)
         b_cf, s_cf = self.encode(x_counterfactual)
 
-        # Decode factual branch (no deep supervision needed)
-        out_f = self.decode(b_f, s_f)
-
-        # Decode counterfactual branch WITH deep supervision
-        feat_cf = {
-            "s1": s_cf["s1"],
-            "s2": s_cf["s2"],
-            "s3": s_cf["s3"],
-            "s4": b_cf,
+        # Decode BOTH branches with deep supervision so auxiliary
+        # deltas are computed at matched abstraction levels.
+        feat_f = {
+            "s1": s_f["s1"], "s2": s_f["s2"],
+            "s3": s_f["s3"], "s4": b_f,
         }
-        result = self.decoder(feat_cf, return_deep=True)
-        if isinstance(result, tuple):
-            out_cf, deep_cf = result
+        feat_cf = {
+            "s1": s_cf["s1"], "s2": s_cf["s2"],
+            "s3": s_cf["s3"], "s4": b_cf,
+        }
+
+        result_f = self.decoder(feat_f, return_deep=True)
+        result_cf = self.decoder(feat_cf, return_deep=True)
+
+        if isinstance(result_f, tuple):
+            out_f, deep_f = result_f
         else:
-            out_cf, deep_cf = result, []
+            out_f, deep_f = result_f, []
+
+        if isinstance(result_cf, tuple):
+            out_cf, deep_cf = result_cf
+        else:
+            out_cf, deep_cf = result_cf, []
 
         # Main delta = cf - f in output space
         delta = torch.clamp(out_cf - out_f, 0.0, 1.0)
 
-        # Deep supervision deltas: each aux cf output minus the
-        # factual output (resized to match aux resolution)
+        # Deep supervision deltas: matched intermediate outputs.
+        # aux_cf[i] and aux_f[i] come from the same decoder node
+        # (x01, x02, x12), so they encode features at the same
+        # level of abstraction — gradient signal is clean.
         deep_deltas = []
-        for aux_cf in deep_cf:
-            if aux_cf.shape[2:] != out_f.shape[2:]:
-                out_f_resized = F.interpolate(
-                    out_f, size=aux_cf.shape[2:],
-                    mode="bilinear", align_corners=False,
-                )
-            else:
-                out_f_resized = out_f
-            deep_deltas.append(torch.clamp(aux_cf - out_f_resized, 0.0, 1.0))
+        for aux_cf, aux_f in zip(deep_cf, deep_f):
+            deep_deltas.append(torch.clamp(aux_cf - aux_f, 0.0, 1.0))
 
         return delta, deep_deltas, out_f, out_cf
 

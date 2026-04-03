@@ -4,8 +4,17 @@ SMAP Soil Dataset — Counterfactual Soil Impact (Synthetic)
 Generates synthetic soil data where the target is the INCREASE
 in soil degradation caused by deforestation of nearby areas.
 
-Input:  [B, 5, H, W]  — 4 soil features + deforestation mask
+Input:  [B, 7, H, W]  — forest + smap + terrain + deforestation mask
 Target: [B, 1, H, W]  — soil degradation impact delta [0, 1]
+
+Channels (7):
+    0: forest_cover (canopy %, deforestation-aware)
+    1: smap_soil_moisture (baseline moisture, normalised)
+    2: slope (SRTM, normalised degrees)
+    3: elevation (SRTM DEM, normalised)
+    4: aspect (sin-encoded, [0, 1))
+    5: flow_accumulation (log-normalised)
+    6: deforestation_mask (binary: 1=cleared)
 """
 
 from __future__ import annotations
@@ -49,9 +58,24 @@ class SMAPSoilDataset(Dataset):
             0, 1,
         ).astype(np.float32)
 
-        # Slope (terrain proxy)
-        slope = np.clip(
-            gaussian_filter(rng.randn(H, W), sigma=15) * 0.3 + 0.2,
+        # Terrain — generate elevation first, derive slope/aspect/flow_acc
+        elevation_raw = gaussian_filter(rng.randn(H, W), sigma=25) * 500 + 1000
+        elevation_raw = elevation_raw.astype(np.float32)
+        e_min, e_max = elevation_raw.min(), elevation_raw.max()
+        elevation = ((elevation_raw - e_min) / (e_max - e_min + 1e-8)).astype(np.float32)
+
+        dy, dx = np.gradient(elevation_raw)
+        slope_raw = np.sqrt(dx ** 2 + dy ** 2)
+        slope = np.clip(slope_raw / (slope_raw.max() + 1e-8), 0, 1).astype(np.float32)
+        aspect = ((np.arctan2(dy, dx) + np.pi) / (2 * np.pi)).astype(np.float32)
+
+        flow_acc_raw = gaussian_filter(np.maximum(0, -dy), sigma=10)
+        fa_max = flow_acc_raw.max()
+        flow_acc = (flow_acc_raw / (fa_max + 1e-8)).astype(np.float32)
+
+        # Synthetic SMAP soil moisture — mimics baseline moisture conditions
+        smap_norm = np.clip(
+            gaussian_filter(rng.randn(H, W), sigma=15) * 0.2 + 0.5,
             0, 1,
         ).astype(np.float32)
 
@@ -68,14 +92,10 @@ class SMAPSoilDataset(Dataset):
         cleared_forest = forest.copy()
         cleared_forest[deforestation_mask > 0.5] = 0.0
 
-        # Soil proxies derived from forest cover
-        moisture = cleared_forest * 0.8 + 0.2
-        veg_water = cleared_forest * 0.9
-        temp = 1.0 - cleared_forest * 0.6
-
-        # Stack: [5, H, W]
+        # Stack: [7, H, W] — matches RealSoilDataset channel layout
         obs = np.stack([
-            moisture, veg_water, temp, slope, deforestation_mask,
+            cleared_forest, smap_norm, slope, elevation,
+            aspect, flow_acc, deforestation_mask,
         ], axis=0)
 
         # ── Counterfactual soil degradation target ──

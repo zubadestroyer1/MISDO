@@ -51,11 +51,12 @@ from __future__ import annotations
 
 import json
 import os
+import random as _random
 from typing import Tuple
 
 import numpy as np
 import torch
-from scipy.ndimage import binary_dilation, gaussian_filter, label
+from scipy.ndimage import binary_dilation, distance_transform_edt, gaussian_filter, label
 from torch import Tensor
 from torch.utils.data import Dataset
 
@@ -81,6 +82,7 @@ import logging as _logging
 _chip_logger = _logging.getLogger("misdo.chip_validation")
 
 _MAX_SKIP_WARNINGS = 50  # cap per-process to avoid log spam
+_nan_warn_state: list[int] = [0]  # mutable counter for optional-key NaN/Inf warnings
 
 
 def validate_chip(
@@ -149,12 +151,14 @@ def validate_chip(
             if key in data:
                 arr = data[key]
                 if np.any(np.isnan(arr)) or np.any(np.isinf(arr)):
-                    _chip_logger.debug(
-                        "%s: optional key '%s' contains NaN/Inf "
-                        "(will be replaced by nan_to_num fallback)",
-                        basename,
-                        key,
-                    )
+                    if _nan_warn_state[0] < _MAX_SKIP_WARNINGS:
+                        _chip_logger.warning(
+                            "%s: optional key '%s' contains NaN/Inf "
+                            "(will be replaced by nan_to_num fallback)",
+                            basename,
+                            key,
+                        )
+                        _nan_warn_state[0] += 1
 
     return True, ""
 
@@ -212,6 +216,10 @@ def compute_global_target_scale(
         except Exception:
             continue
 
+        valid, _ = validate_chip(data, file_path)
+        if not valid:
+            continue
+
         tc = data["treecover2000"].astype(np.float32) / 100.0
         lossyear = data["lossyear"].astype(np.float32)
 
@@ -233,7 +241,8 @@ def compute_global_target_scale(
                 (lossyear > t2) & (lossyear <= t_impact)
             ).astype(np.float32)
             raw_target = _control_baseline(
-                additional_loss, deforestation_mask, forest_mask, near_radius=15,
+                additional_loss, deforestation_mask, forest_mask,
+                near_radius=15, decay_sigma=10.0,  # forest: ~300m cascade
             )
 
         elif model_name == "fire":
@@ -246,7 +255,8 @@ def compute_global_target_scale(
             ).astype(np.float32)
             fire_change = future_loss * near_clearing
             raw_target = _control_baseline(
-                fire_change, deforestation_mask, forest_mask, near_radius=15,
+                fire_change, deforestation_mask, forest_mask,
+                near_radius=15, decay_sigma=17.0,  # fire: ~500m ember transport
             )
 
         elif model_name == "hydro":
@@ -290,7 +300,8 @@ def compute_global_target_scale(
             # Control-baseline subtraction (matches __getitem__ lines 952-954)
             forest_mask_soil = (forest_at_t2_soil > 0.3).astype(np.float32)
             raw_target = _control_baseline(
-                raw_degradation, clearing, forest_mask_soil, near_radius=10,
+                raw_degradation, clearing, forest_mask_soil,
+                near_radius=10, decay_sigma=7.0,  # soil: ~200m surface erosion
             )
 
             # SMAP soil moisture weighting (matches __getitem__ lines 958-965)
@@ -369,12 +380,15 @@ def _control_baseline(
     deforestation_mask: np.ndarray,
     forest_mask: np.ndarray,
     near_radius: int = 15,
+    decay_sigma: float = 10.0,
 ) -> np.ndarray:
     """Subtract background change to isolate causal impact signal.
 
-    Compares metric change near clearings vs. far from clearings
-    within the same chip.  Returns the EXCESS change attributable
-    to the clearing.
+    Uses a smooth Gaussian distance decay instead of a hard binary
+    near/far boundary.  This matches the physical reality that
+    deforestation impact (erosion, fire spread, hydrological change)
+    propagates via diffusion-like processes that attenuate with
+    distance.
 
     Parameters
     ----------
@@ -385,27 +399,41 @@ def _control_baseline(
     forest_mask : ndarray [H, W]
         Binary mask of remaining forest.
     near_radius : int
-        Dilation radius defining "near clearing" zone.
+        Dilation radius for defining "far" background zone (pixels
+        beyond this radius are used for background estimation).
+    decay_sigma : float
+        Gaussian decay width in pixels for the impact weight.
+        Domain-specific recommended values:
+          - Fire:   ~17 pixels (~500m at 30m/pixel, ember transport)
+          - Forest:  ~10 pixels (~300m, cascade contagion)
+          - Hydro:   ~15 pixels (~450m, runoff propagation)
+          - Soil:    ~7 pixels  (~200m, surface erosion)
     """
-    # Define "near clearing" zone (impacted area)
-    near_zone = binary_dilation(
-        deforestation_mask > 0.5, iterations=near_radius
-    ).astype(np.float32)
-    near_forest = near_zone * forest_mask
+    clearing_binary = deforestation_mask > 0.5
 
-    # "Far from clearing" = forested but outside the near zone
+    # Distance from nearest clearing pixel (in pixels)
+    dist = distance_transform_edt(~clearing_binary)
+
+    # Smooth impact weight: 1.0 at clearing, decays to ~0 beyond ~3×sigma
+    impact_weight = np.exp(-0.5 * (dist / max(decay_sigma, 0.1)) ** 2)
+    impact_weight[clearing_binary] = 1.0
+
+    # Background zone: forested pixels OUTSIDE the near_radius dilation.
+    # We still use binary_dilation to define the background exclusion
+    # zone, ensuring background pixels are truly unaffected.
+    near_zone = binary_dilation(
+        clearing_binary, iterations=near_radius,
+    ).astype(np.float32)
     far_forest = (1.0 - near_zone) * forest_mask
 
-    # Compute background rate (change in far-from-clearing forest)
+    # Background rate from truly far pixels
     far_sum = (metric_change * far_forest).sum()
     far_count = far_forest.sum()
     background_rate = far_sum / (far_count + 1e-8) if far_count > 100 else 0.0
 
-    # Excess = observed change - background rate
+    # Excess impact, weighted by distance-based proximity
     excess = metric_change - background_rate
-    # Only keep positive excess (clearing caused MORE of the effect)
     excess = np.clip(excess, 0, None)
-    # Only measure in forested areas (not in the cleared zone itself)
     excess = excess * forest_mask
 
     return excess
@@ -518,12 +546,12 @@ class RealHansenDataset(Dataset):
                 data = np.load(file_path)
             except Exception as exc:
                 _chip_logger.warning("Corrupted chip %s: %s — skipping", file_path, exc)
-                idx = np.random.randint(len(self.entries))
+                idx = _random.randrange(len(self.entries))
                 continue
             valid, reason = validate_chip(data, file_path, domain="forest")
             if not valid:
                 _chip_logger.warning("Skipping chip: %s", reason)
-                idx = np.random.randint(len(self.entries))
+                idx = _random.randrange(len(self.entries))
                 continue
             break
         else:
@@ -604,7 +632,8 @@ class RealHansenDataset(Dataset):
         forest_mask = (forest_at_t2 > 0.3).astype(np.float32)
 
         cascade_impact = _control_baseline(
-            additional_loss, deforestation_mask, forest_mask, near_radius=15,
+            additional_loss, deforestation_mask, forest_mask,
+            near_radius=15, decay_sigma=10.0,  # forest: ~300m cascade
         )
 
         if self.target_scale is not None:
@@ -614,7 +643,7 @@ class RealHansenDataset(Dataset):
             if ci_max > 1e-8:
                 cascade_impact = cascade_impact / ci_max
 
-        cascade_impact = gaussian_filter(cascade_impact, sigma=2.0)
+        cascade_impact = gaussian_filter(cascade_impact, sigma=0.5)
         cascade_impact = np.clip(cascade_impact, 0, 1)
         target = cascade_impact[np.newaxis, :, :]
 
@@ -681,12 +710,12 @@ class RealFireDataset(Dataset):
                 data = np.load(file_path)
             except Exception as exc:
                 _chip_logger.warning("Corrupted chip %s: %s — skipping", file_path, exc)
-                idx = np.random.randint(len(self.entries))
+                idx = _random.randrange(len(self.entries))
                 continue
             valid, reason = validate_chip(data, file_path, domain="fire")
             if not valid:
                 _chip_logger.warning("Skipping chip: %s", reason)
-                idx = np.random.randint(len(self.entries))
+                idx = _random.randrange(len(self.entries))
                 continue
             break
         else:
@@ -749,6 +778,23 @@ class RealFireDataset(Dataset):
                 frp = data["viirs_mean_frp"].astype(np.float32)
                 bright_ti4 = data["viirs_max_bright_ti4"].astype(np.float32)
                 bright_ti5 = data["viirs_max_bright_ti5"].astype(np.float32)
+
+                # Normalise VIIRS channels to [0, 1] per-chip.
+                # Raw scales vary wildly (counts 0–500+, FRP in MW,
+                # brightness in Kelvin 300–500+) and would dominate
+                # gradient updates vs. other [0,1] channels.
+                _fa_max = fire_at_year.max()
+                if _fa_max > 1e-6:
+                    fire_at_year = fire_at_year / _fa_max
+                _frp_max = frp.max()
+                if _frp_max > 1e-6:
+                    frp = frp / _frp_max
+                _ti4_max = bright_ti4.max()
+                if _ti4_max > 1e-6:
+                    bright_ti4 = bright_ti4 / _ti4_max
+                _ti5_max = bright_ti5.max()
+                if _ti5_max > 1e-6:
+                    bright_ti5 = bright_ti5 / _ti5_max
 
                 # Factual: no clearing mask
                 frame_f = np.stack([
@@ -823,7 +869,8 @@ class RealFireDataset(Dataset):
             fire_change = future_loss * near_clearing
 
         fire_impact = _control_baseline(
-            fire_change, deforestation_mask, forest_mask, near_radius=15,
+            fire_change, deforestation_mask, forest_mask,
+            near_radius=15, decay_sigma=17.0,  # fire: ~500m ember transport
         )
 
         if self.target_scale is not None:
@@ -833,7 +880,7 @@ class RealFireDataset(Dataset):
             if fi_max > 1e-8:
                 fire_impact = fire_impact / fi_max
 
-        fire_impact = gaussian_filter(fire_impact, sigma=2.0)
+        fire_impact = gaussian_filter(fire_impact, sigma=0.5)
         fire_impact = np.clip(fire_impact, 0, 1)
         target = fire_impact[np.newaxis, :, :]
 
@@ -877,7 +924,7 @@ class RealHydroDataset(Dataset):
     therefore locked to ``(lossyear > 16) & (lossyear <= 20)`` to
     maintain causal alignment between input and target.
 
-    Input:  [6, 256, 256]  — terrain + forest + deforestation mask
+    Input:  [7, 256, 256]  — terrain + forest + ndssi_baseline + deforestation mask
     Target: [1, 256, 256]  — water pollution impact delta [0, 1]
     """
 
@@ -917,16 +964,26 @@ class RealHydroDataset(Dataset):
                 data = np.load(file_path)
             except Exception as exc:
                 _chip_logger.warning("Corrupted chip %s: %s — skipping", file_path, exc)
-                idx = np.random.randint(len(self.entries))
+                idx = _random.randrange(len(self.entries))
                 continue
             valid, reason = validate_chip(data, file_path, domain="hydro")
             if not valid:
                 _chip_logger.warning("Skipping chip: %s", reason)
-                idx = np.random.randint(len(self.entries))
+                idx = _random.randrange(len(self.entries))
                 continue
+
+            # Additional hydro check: must have real NDSSI data
+            if "msi_ndssi_delta" not in data or np.all(data["msi_ndssi_delta"] == 0):
+                _chip_logger.debug("No real NDSSI in %s — resampling", file_path)
+                idx = _random.randrange(len(self.entries))
+                continue
+                
             break
         else:
             raise RuntimeError("Failed to load a valid chip after 5 attempts")
+        # NOTE: Hydro uses a fixed temporal window (_HYDRO_T1/_HYDRO_T2),
+        # so per-epoch randomisation only affects single-patch augmentation
+        # (not temporal sliding, which is unused for this dataset).
         rng = np.random.RandomState(idx + self._epoch_seed)
 
         tc = data["treecover2000"].astype(np.float32) / 100.0
@@ -956,46 +1013,33 @@ class RealHydroDataset(Dataset):
         forest = tc.copy()
         forest[(lossyear > 0) & (lossyear <= t2)] = 0.0
 
-        # Factual input: [6, H, W] — terrain + forest + NO deforestation mask
+        # Baseline NDSSI — gives the model visibility into pre-clearing
+        # water quality so it can learn that high-sediment areas respond
+        # more strongly to further clearing.
+        ndssi_baseline = data.get("msi_ndssi_baseline", np.zeros_like(tc))
+        ndssi_baseline = np.clip(
+            np.nan_to_num(ndssi_baseline.astype(np.float32)), 0, 1,
+        )
+
+        # Factual input: [7, H, W] — terrain + forest + ndssi_baseline + NO deforestation mask
         obs_f = np.stack([
-            elevation, slope, aspect, flow_acc, forest, no_deforestation,
+            elevation, slope, aspect, flow_acc, forest,
+            ndssi_baseline, no_deforestation,
         ], axis=0)
 
-        # Counterfactual input: [6, H, W] — terrain + forest + deforestation mask
+        # Counterfactual input: [7, H, W] — terrain + forest + ndssi_baseline + deforestation mask
         obs_cf = np.stack([
-            elevation, slope, aspect, flow_acc, forest, deforestation_mask,
+            elevation, slope, aspect, flow_acc, forest,
+            ndssi_baseline, deforestation_mask,
         ], axis=0)
 
         # ── Real Sentinel-2 NDSSI Target ──
-        # Fetch actual water pollution / suspended sediment delta
-        # Skip chips that lack real MSI data (retry with another chip)
-        if "msi_ndssi_delta" not in data or np.all(data["msi_ndssi_delta"] == 0):
-            # This chip has no real NDSSI target — retry with a different chip
-            idx2 = np.random.randint(len(self.entries))
-            entry2 = self.entries[idx2]
-            file2 = _resolve_chip_path(self.tiles_dir, entry2["file"])
-            try:
-                data2 = np.load(file2)
-                if "msi_ndssi_delta" in data2 and not np.all(data2["msi_ndssi_delta"] == 0):
-                    data = data2
-                    # Re-read inputs from the new chip
-                    tc = data["treecover2000"].astype(np.float32) / 100.0
-                    lossyear = data["lossyear"].astype(np.float32)
-                    elevation = np.clip(np.nan_to_num(data.get("srtm_elevation", np.zeros_like(tc))), 0, 1).astype(np.float32)
-                    slope = np.clip(np.nan_to_num(data.get("srtm_slope", np.zeros_like(tc))), 0, 1).astype(np.float32)
-                    aspect = np.clip(np.nan_to_num(data.get("srtm_aspect", np.zeros_like(tc))), 0, 1).astype(np.float32)
-                    flow_acc = np.clip(np.nan_to_num(data.get("srtm_flow_acc", np.zeros_like(tc))), 0, 1).astype(np.float32)
-                    # Recompute deforestation mask
-                    deforestation_mask = ((lossyear > t1) & (lossyear <= t2)).astype(np.float32)
-                    no_deforestation = np.zeros_like(deforestation_mask)
-                    forest = tc.copy()
-                    forest[(lossyear > 0) & (lossyear <= t2)] = 0.0
-                    obs_f = np.stack([elevation, slope, aspect, flow_acc, forest, no_deforestation], axis=0)
-                    obs_cf = np.stack([elevation, slope, aspect, flow_acc, forest, deforestation_mask], axis=0)
-            except Exception:
-                pass  # Fall through to zero target
-
-        pollution_delta = data.get("msi_ndssi_delta", np.zeros_like(tc)).astype(np.float32)
+        # The NDSSI delta from download_msi_smap.py is already a first-
+        # difference observation (NDSSI_before - NDSSI_after), so no
+        # _control_baseline() subtraction is needed here — unlike the
+        # derived lossyear-based targets in forest/fire/soil, which
+        # require control-pixel subtraction to isolate causal signal.
+        pollution_delta = data["msi_ndssi_delta"].astype(np.float32)
 
         if self.target_scale is not None:
             pollution_delta = pollution_delta / (self.target_scale + 1e-8)
@@ -1006,7 +1050,7 @@ class RealHydroDataset(Dataset):
 
         # Gaussian smoothing (consistent with forest/fire/soil targets)
         # Prevents overfitting to pixel-level satellite noise in NDSSI.
-        pollution_delta = gaussian_filter(pollution_delta, sigma=2.0)
+        pollution_delta = gaussian_filter(pollution_delta, sigma=0.5)
         pollution_delta = np.clip(pollution_delta, 0, 1)
         target = pollution_delta[np.newaxis, :, :]
 
@@ -1035,7 +1079,7 @@ class RealSoilDataset(Dataset):
     ensuring the model learns a causal relationship between clearing
     location and soil degradation.
 
-    Input:  [T, 5, 256, 256]  — soil state + deforestation mask
+    Input:  [T, 7, 256, 256]  — forest + smap + terrain + deforestation mask
     Target: [1, 256, 256]     — soil degradation impact delta [0, 1]
     """
 
@@ -1079,12 +1123,12 @@ class RealSoilDataset(Dataset):
                 data = np.load(file_path)
             except Exception as exc:
                 _chip_logger.warning("Corrupted chip %s: %s — skipping", file_path, exc)
-                idx = np.random.randint(len(self.entries))
+                idx = _random.randrange(len(self.entries))
                 continue
             valid, reason = validate_chip(data, file_path, domain="soil")
             if not valid:
                 _chip_logger.warning("Skipping chip: %s", reason)
-                idx = np.random.randint(len(self.entries))
+                idx = _random.randrange(len(self.entries))
                 continue
             break
         else:
@@ -1096,6 +1140,17 @@ class RealSoilDataset(Dataset):
 
         slope = np.clip(np.nan_to_num(data.get("srtm_slope", np.zeros_like(tc))), 0, 1).astype(np.float32)
         elevation = np.clip(np.nan_to_num(data.get("srtm_elevation", np.zeros_like(tc))), 0, 1).astype(np.float32)
+        aspect = np.clip(np.nan_to_num(data.get("srtm_aspect", np.zeros_like(tc))), 0, 1).astype(np.float32)
+        flow_acc = np.clip(np.nan_to_num(data.get("srtm_flow_acc", np.zeros_like(tc))), 0, 1).astype(np.float32)
+
+        # Real SMAP soil moisture — gives the model visibility into
+        # baseline moisture conditions.  Previously only used to
+        # weight the target; now also an input so the model can learn
+        # that high-moisture areas are more vulnerable to degradation.
+        smap_raw = data.get("smap_soil_moisture", np.zeros_like(tc))
+        smap_raw = np.nan_to_num(smap_raw.astype(np.float32))
+        _smap_max = smap_raw.max()
+        smap_norm = smap_raw / _smap_max if _smap_max > 1e-8 else np.zeros_like(smap_raw)
 
         # ── Sample temporal window ──
         t1, t2, t_impact = _sample_window(
@@ -1125,19 +1180,18 @@ class RealSoilDataset(Dataset):
             forest = tc.copy()
             forest[(lossyear > 0) & (lossyear <= year)] = 0.0
 
-            moisture = forest * 0.8 + 0.2
-            veg_water = forest * 0.9
-            temp = 1.0 - forest * 0.6
-
             # Factual: no clearing mask
+            # Channels: forest, smap, slope, elevation, aspect, flow_acc, deforestation_mask
             frame_f = np.stack([
-                moisture, veg_water, temp, slope, no_deforestation,
+                forest, smap_norm, slope, elevation,
+                aspect, flow_acc, no_deforestation,
             ], axis=0)
             frames_factual.append(frame_f)
 
             # Counterfactual: real clearing mask
             frame_cf = np.stack([
-                moisture, veg_water, temp, slope, deforestation_mask,
+                forest, smap_norm, slope, elevation,
+                aspect, flow_acc, deforestation_mask,
             ], axis=0)
             frames_counterfactual.append(frame_cf)
 
@@ -1169,7 +1223,8 @@ class RealSoilDataset(Dataset):
         # Combined: exposure delta + cascade, with control-baseline subtraction
         raw_degradation = exposure_delta + cascade_exposure * 0.5
         soil_impact = _control_baseline(
-            raw_degradation, deforestation_mask, forest_mask, near_radius=10,
+            raw_degradation, deforestation_mask, forest_mask,
+            near_radius=10, decay_sigma=7.0,  # soil: ~200m surface erosion
         )
 
         # If real SMAP soil moisture is available, use it to weight the target:
@@ -1190,7 +1245,7 @@ class RealSoilDataset(Dataset):
             if si_max > 1e-8:
                 soil_impact = soil_impact / si_max
 
-        soil_impact = gaussian_filter(soil_impact, sigma=2.0)
+        soil_impact = gaussian_filter(soil_impact, sigma=0.5)
         degradation = np.clip(soil_impact, 0, 1)
         target = degradation[np.newaxis, :, :]
 

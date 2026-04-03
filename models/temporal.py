@@ -149,9 +149,6 @@ class TemporalSkipFusion(nn.Module):
             nn.Linear(channels // 4, 1),
         )
 
-        # Layer norm applied per-timestep
-        self.norm = nn.GroupNorm(1, channels)
-
         # Learnable temporal position bias
         self.pos_bias = nn.Parameter(
             torch.zeros(1, max_timesteps, 1, 1, 1)

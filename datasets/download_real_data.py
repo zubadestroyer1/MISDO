@@ -138,20 +138,11 @@ GFC_BASE_URL = (
 )
 GFC_LAYERS = ["treecover2000", "lossyear", "gain"]
 
-SRTM_URL_TEMPLATE = (
-    "https://s3.amazonaws.com/elevation-tiles-prod/skadi/"
-    "{ns_dir}/{ns_dir}{ew_str}.hgt.gz"
-)
-
+# FIRMS API — per-chip fire queries (rate-limited, max 1 day per request)
+# See: https://firms.modaps.eosdis.nasa.gov/api/area/
 FIRMS_API_URL = (
     "https://firms.modaps.eosdis.nasa.gov/api/area/csv/"
-    "{key}/VIIRS_SNPP_SP/{west},{south},{east},{north}/10/{date}"
-)
-
-# FIRMS bulk archive download URLs (VIIRS SNPP C2, last 7 days + yearly archives)
-FIRMS_ARCHIVE_BASE = (
-    "https://firms.modaps.eosdis.nasa.gov/data/active_fire/"
-    "suomi-npp-viirs-c2/csv/"
+    "{key}/VIIRS_SNPP_SP/{west},{south},{east},{north}/1/{date}"
 )
 
 
@@ -248,65 +239,46 @@ def download_viirs_archive(
     output_dir: str,
     years: Optional[List[int]] = None,
 ) -> List[str]:
-    """Download FIRMS VIIRS SNPP bulk archive CSVs.
+    """Scan for user-provided FIRMS VIIRS bulk archive CSVs.
 
-    Downloads yearly archive files to ``{output_dir}/.viirs_cache/``.
-    Skips files that already exist (cached).
+    NASA FIRMS does not expose yearly bulk CSV files via direct URLs.
+    Users must download CSVs manually from the FIRMS Archive Download
+    tool (https://firms.modaps.eosdis.nasa.gov/download/) and place
+    them in ``{output_dir}/.viirs_cache/``.
+
+    This function scans that cache directory for any ``.csv`` files
+    and returns their paths.
 
     Parameters
     ----------
     output_dir : str
         Base output directory (e.g. ``datasets/real_tiles``).
     years : list of int, optional
-        Years to download (default: 2018-2023).
+        Ignored (kept for backwards compatibility).
 
     Returns
     -------
     list of str
-        Paths to downloaded CSV files.
+        Paths to CSV files found in the cache directory.
     """
-    if years is None:
-        years = list(range(2018, 2024))
+    import glob as glob_mod
 
     cache_dir = os.path.join(output_dir, ".viirs_cache")
     os.makedirs(cache_dir, exist_ok=True)
 
-    csv_paths = []
-    for year in years:
-        filename = f"fire_nrt_SV-C2_{year}.csv"
-        local_path = os.path.join(cache_dir, filename)
+    csv_paths = sorted(glob_mod.glob(os.path.join(cache_dir, "*.csv")))
 
-        if os.path.exists(local_path):
-            print(f"  VIIRS {year}: cached ({local_path})")
-            csv_paths.append(local_path)
-            continue
-
-        # Try multiple URL patterns (FIRMS uses different naming conventions)
-        urls_to_try = [
-            f"{FIRMS_ARCHIVE_BASE}fire_nrt_SV-C2_{year}.csv",
-            f"{FIRMS_ARCHIVE_BASE}fire_archive_SV-C2_{year}.csv",
-        ]
-
-        downloaded = False
-        for url in urls_to_try:
-            try:
-                print(f"  VIIRS {year}: downloading from {url}...")
-                req = urllib.request.Request(
-                    url, headers={"User-Agent": "MISDO/1.0"}
-                )
-                with urllib.request.urlopen(req, timeout=120) as resp:
-                    data = resp.read()
-                with open(local_path, "wb") as f:
-                    f.write(data)
-                print(f"  VIIRS {year}: ✓ saved ({len(data) / 1e6:.1f} MB)")
-                csv_paths.append(local_path)
-                downloaded = True
-                break
-            except Exception as e:
-                continue
-
-        if not downloaded:
-            print(f"  VIIRS {year}: ✗ not available (will skip)")
+    if csv_paths:
+        total_mb = sum(os.path.getsize(p) for p in csv_paths) / 1e6
+        print(f"  VIIRS archive: found {len(csv_paths)} CSV file(s) "
+              f"({total_mb:.1f} MB) in {cache_dir}")
+    else:
+        print(f"  VIIRS archive: no CSV files found in {cache_dir}")
+        print(f"  To add VIIRS fire data:")
+        print(f"    1. Go to https://firms.modaps.eosdis.nasa.gov/download/")
+        print(f"    2. Select VIIRS S-NPP, your area of interest, and date range")
+        print(f"    3. Download the CSV and place it in {cache_dir}")
+        print(f"    4. Or use --viirs-archive /path/to/your/csvs/")
 
     return csv_paths
 
@@ -391,9 +363,8 @@ def _download_srtm_hgt(lat: float, lon: float, cache_dir: str) -> Optional[np.nd
         if data.size == 3601 * 3601:
             return data.reshape(3601, 3601).astype(np.float32)
 
-    url = SRTM_URL_TEMPLATE.format(ns_dir=ns_dir, ew_str=ew_str)
-    # Fix the URL: skadi expects {ns_dir}/{ns_dir}{ew_str}
-    # where ns_dir = "N10" and full tile = "N10W070"
+    # AWS Skadi SRTM format: {lat_dir}/{lat_dir}{lon_dir}.hgt.gz
+    # e.g. https://s3.amazonaws.com/elevation-tiles-prod/skadi/N10/N10W070.hgt.gz
     url = (
         f"https://s3.amazonaws.com/elevation-tiles-prod/skadi/"
         f"{ns_dir}/{full_name}.hgt.gz"
@@ -421,44 +392,6 @@ def _download_srtm_hgt(lat: float, lon: float, cache_dir: str) -> Optional[np.nd
         return None
 
 
-def _extract_srtm_chip(
-    srtm_tile: np.ndarray,
-    tile_lat: int,
-    tile_lon: int,
-    west: float,
-    south: float,
-    east: float,
-    north: float,
-    chip_size: int = 256,
-) -> np.ndarray:
-    """Extract and resample a chip-sized region from an SRTM tile.
-
-    SRTM tiles are 3601×3601 covering 1°×1°, with the origin at NW corner.
-    """
-    # Pixel coordinates within the SRTM tile
-    px_per_deg = 3600  # 3601 samples over 1°
-
-    col_start = int((west - tile_lon) * px_per_deg)
-    col_end = int((east - tile_lon) * px_per_deg)
-    row_start = int((tile_lat + 1 - north) * px_per_deg)  # NW origin
-    row_end = int((tile_lat + 1 - south) * px_per_deg)
-
-    # Clamp
-    col_start = max(0, min(col_start, 3600))
-    col_end = max(col_start + 1, min(col_end, 3601))
-    row_start = max(0, min(row_start, 3600))
-    row_end = max(row_start + 1, min(row_end, 3601))
-
-    crop = srtm_tile[row_start:row_end, col_start:col_end]
-
-    # Resample to chip_size × chip_size using simple interpolation
-    if crop.shape[0] < 2 or crop.shape[1] < 2:
-        return np.zeros((chip_size, chip_size), dtype=np.float32)
-
-    from PIL import Image
-    img = Image.fromarray(crop)
-    img_resized = img.resize((chip_size, chip_size), Image.BILINEAR)
-    return np.array(img_resized, dtype=np.float32)
 
 
 def _derive_real_terrain(elevation: np.ndarray) -> Dict[str, np.ndarray]:
@@ -483,16 +416,33 @@ def _derive_real_terrain(elevation: np.ndarray) -> Dict[str, np.ndarray]:
     else:
         elev_norm = np.zeros_like(elevation)
 
-    # Gradient computation (central differences)
-    dy, dx = np.gradient(elevation)
+    # Gradient computation (central differences) with physical pixel spacing.
+    # SRTM native resolution is ~30 m/pixel. Chips are resampled to 256×256
+    # from a small region of the 3601×3601 tile; using the native 30 m spacing
+    # gives physically meaningful dz/dx ratios for slope computation.
+    pixel_spacing_m = 30.0
+    dy, dx = np.gradient(elevation, pixel_spacing_m)
 
     # Slope (degrees, normalised to [0, 1] where 1 = 45°+)
     slope_deg = np.degrees(np.arctan(np.sqrt(dx**2 + dy**2)))
     slope_norm = np.clip(slope_deg / 45.0, 0, 1).astype(np.float32)
 
-    # Aspect (normalised to [0, 1] where 0=N, 0.25=E, 0.5=S, 0.75=W)
-    aspect_rad = np.arctan2(-dy, dx)  # mathematical angle
-    aspect_norm = ((aspect_rad + np.pi) / (2 * np.pi)).astype(np.float32)
+    # Aspect: compass bearing of steepest descent direction.
+    # Convention: 0=N, 0.25=E, 0.5=S, 0.75=W (normalised to [0,1]).
+    #
+    # np.gradient returns (dy, dx) where:
+    #   dy = dz/drow — row increases southward (NW-origin raster)
+    #   dx = dz/dcol — column increases eastward
+    #
+    # Descent vector components:
+    #   North component of descent = +dy  (positive dy means elevation
+    #     rises going south, so descent is northward)
+    #   East component of descent = -dx   (positive dx means elevation
+    #     rises going east, so descent is westward → east component is -dx)
+    #
+    # Compass bearing (CW from North) = atan2(east, north)
+    aspect_rad = np.arctan2(-dx, dy)
+    aspect_norm = (np.mod(aspect_rad, 2 * np.pi) / (2 * np.pi)).astype(np.float32)
 
     # Flow accumulation (simple D8-based approximation)
     # Accumulate flow by tracing downhill from each cell
@@ -528,13 +478,50 @@ def _compute_flow_direction(dx: np.ndarray, dy: np.ndarray) -> np.ndarray:
     return np.clip(flow_dir, 0, 1)
 
 
+def _fill_single_sinks(elevation: np.ndarray) -> np.ndarray:
+    """Fill single-pixel sinks by raising them to the lowest neighbour.
+
+    Only fills sinks where ALL 8 neighbours are strictly higher
+    (true single-cell depressions, typically DEM noise).
+    Does NOT fill multi-cell depressions (which would require
+    iterative priority-flood filling beyond chip-level scope).
+
+    Parameters
+    ----------
+    elevation : ndarray (H, W)
+        Raw elevation in metres.
+
+    Returns
+    -------
+    ndarray (H, W)
+        Elevation with single-pixel sinks filled.
+    """
+    h, w = elevation.shape
+    pad = np.pad(elevation, 1, mode="edge")
+    dr = np.array([-1, -1, -1,  0, 0,  1, 1, 1])
+    dc = np.array([-1,  0,  1, -1, 1, -1, 0, 1])
+    neighbours = np.stack([
+        pad[1 + dri : 1 + dri + h, 1 + dci : 1 + dci + w]
+        for dri, dci in zip(dr, dc)
+    ], axis=0)
+    min_neighbour = neighbours.min(axis=0)
+    is_sink = elevation < min_neighbour
+    filled = elevation.copy()
+    filled[is_sink] = min_neighbour[is_sink]
+    return filled
+
+
 def _compute_flow_accumulation(elevation: np.ndarray) -> np.ndarray:
     """Vectorised D8 flow accumulation using NumPy.
 
-    Computes the steepest-descent neighbour for every cell in parallel,
-    then does a topological (highest-first) scan to accumulate flow.
-    ~100× faster than the per-pixel Python loop.
+    Pre-processes the DEM by filling single-pixel sinks (Jenson &
+    Domingue 1988), then computes the steepest-descent neighbour for
+    every cell in parallel and does a topological (highest-first)
+    scan to accumulate flow.  ~100× faster than per-pixel Python.
     """
+    # Fill single-pixel sinks to prevent flow trapping at DEM noise
+    elevation = _fill_single_sinks(elevation)
+
     h, w = elevation.shape
     # Pad elevation to handle borders without conditionals
     pad = np.pad(elevation, 1, mode="edge")
@@ -569,7 +556,11 @@ def _compute_flow_accumulation(elevation: np.ndarray) -> np.ndarray:
     for idx in flat_order:
         r, c = divmod(idx, w)
         if has_downhill[r, c]:
-            flow_acc[target_r[r, c], target_c[r, c]] += flow_acc[r, c]
+            tr, tc = int(target_r[r, c]), int(target_c[r, c])
+            # Bounds check: prevent NumPy negative-index wraparound
+            # at raster borders (border cells may point outside grid)
+            if 0 <= tr < h and 0 <= tc < w:
+                flow_acc[tr, tc] += flow_acc[r, c]
 
     return flow_acc
 
@@ -638,7 +629,7 @@ def download_srtm_for_chip(
     from PIL import Image
     img = Image.fromarray(crop)
     elevation = np.array(
-        img.resize((chip_size, chip_size), Image.BILINEAR), dtype=np.float32
+        img.resize((chip_size, chip_size), getattr(Image, 'Resampling', Image).BILINEAR), dtype=np.float32
     )
 
     return _derive_real_terrain(elevation)
@@ -888,7 +879,7 @@ def _derive_proxy_terrain(treecover: np.ndarray) -> Dict[str, np.ndarray]:
     slope = np.sqrt(dx**2 + dy**2)
     s_max = slope.max()
     slope = slope / (s_max + 1e-8)
-    aspect = (np.arctan2(dy, dx) + np.pi) / (2 * np.pi)
+    aspect = (np.mod(np.arctan2(-dx, dy), 2 * np.pi) / (2 * np.pi))
 
     # Flow accumulation from proxy elevation
     flow_acc = _compute_flow_accumulation(
@@ -939,15 +930,22 @@ def _download_single_chip(
 
     chip_data = {}
     try:
-        # ── 1. Hansen GFC layers ──
+        # ── 1. Hansen GFC layers (with retry for transient HTTP errors) ──
         for layer in GFC_LAYERS:
             url = GFC_BASE_URL + f"Hansen_GFC-2023-v1.11_{layer}_{tile_code}.tif"
-            with rasterio.open(url) as src:
-                window = Window(px, py, chip_size, chip_size)
-                data = src.read(1, window=window)
-                if data.shape != (chip_size, chip_size):
-                    return None
-                chip_data[layer] = data.astype(np.float32)
+            for _attempt in range(3):
+                try:
+                    with rasterio.open(url) as src:
+                        window = Window(px, py, chip_size, chip_size)
+                        data = src.read(1, window=window)
+                        if data.shape != (chip_size, chip_size):
+                            return None
+                        chip_data[layer] = data.astype(np.float32)
+                    break
+                except Exception:
+                    if _attempt == 2:
+                        raise
+                    time.sleep(2 ** _attempt)
 
         # ── 2. SRTM elevation (real terrain) ──
         srtm_data = download_srtm_for_chip(

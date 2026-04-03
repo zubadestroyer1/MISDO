@@ -1,6 +1,14 @@
 """
 CrossDomainFusion — Early Feature Fusion Module
 ==================================================
+
+.. note:: NOT USED IN TRAINING — but actively used at inference time.
+   This module is not imported by ``train_real_models.py`` (each
+   domain model is trained independently).  However, it IS imported
+   and used by ``perception.py``'s ``RealMISDOPerception`` class to
+   fuse bottleneck features across all 4 domain encoders at
+   inference time before decoding.
+
 Lightweight cross-domain attention that exchanges information between
 the bottleneck features of all 4 domain encoders before decoding.
 

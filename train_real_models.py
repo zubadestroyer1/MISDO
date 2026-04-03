@@ -33,6 +33,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -175,6 +176,11 @@ class RadiometricJitter:
     changes.  Applied identically to both factual and counterfactual
     inputs (they share the same sensor tile), but NEVER to the target.
 
+    Only jitters channels that represent real radiometric sensor
+    measurements (e.g. forest cover, fire counts) — NOT terrain-derived
+    channels (elevation, slope, aspect, flow accumulation) which are
+    static DEM products with no inter-sensor variation.
+
     The perturbation is:  x' = clamp(contrast * x + brightness, 0, 1)
 
     Parameters
@@ -185,6 +191,10 @@ class RadiometricJitter:
         Maximum deviation from unit contrast (default ±0.05, so [0.95, 1.05]).
     p : float
         Probability of applying jitter on each call (default 0.5).
+    jitter_channels : list[int] | None
+        Indices of channels to jitter.  If None, ALL channels are
+        jittered (backward-compatible).  If an empty list, jitter is
+        disabled entirely.
     """
 
     def __init__(
@@ -192,10 +202,12 @@ class RadiometricJitter:
         brightness_range: float = 0.03,
         contrast_range: float = 0.05,
         p: float = 0.5,
+        jitter_channels: list[int] | None = None,
     ) -> None:
         self.brightness_range = brightness_range
         self.contrast_range = contrast_range
         self.p = p
+        self.jitter_channels = jitter_channels
 
     def __call__(
         self, obs_f: torch.Tensor, obs_cf: torch.Tensor,
@@ -213,34 +225,103 @@ class RadiometricJitter:
         -------
         obs_f, obs_cf : jittered tensors (same shape, clamped to [0, 1]).
         """
+        # Skip if: probability gate fails, or empty channel mask
         if torch.rand(1).item() > self.p:
             return obs_f, obs_cf
+        if self.jitter_channels is not None and len(self.jitter_channels) == 0:
+            return obs_f, obs_cf
 
-        # Determine the channel dimension
-        # [B, C, H, W] → dim 1; [B, T, C, H, W] → dim 2
-        if obs_f.ndim == 5:
-            n_channels = obs_f.shape[2]
-            shape = (obs_f.shape[0], 1, n_channels, 1, 1)
+        is_5d = obs_f.ndim == 5
+
+        if self.jitter_channels is not None:
+            # ── Selective channel jitter ──
+            # Only perturb the specified channels; leave others untouched.
+            n_jitter = len(self.jitter_channels)
+            if is_5d:
+                shape = (obs_f.shape[0], 1, n_jitter, 1, 1)
+            else:
+                shape = (obs_f.shape[0], n_jitter, 1, 1)
+
+            brightness = (
+                torch.rand(shape, device=obs_f.device, dtype=obs_f.dtype)
+                * 2 * self.brightness_range - self.brightness_range
+            )
+            contrast = (
+                1.0 + (torch.rand(shape, device=obs_f.device, dtype=obs_f.dtype)
+                       * 2 * self.contrast_range - self.contrast_range)
+            )
+
+            obs_f = obs_f.clone()
+            obs_cf = obs_cf.clone()
+            for j, ch in enumerate(self.jitter_channels):
+                if is_5d:
+                    b_j = brightness[:, :, j:j+1, :, :]
+                    c_j = contrast[:, :, j:j+1, :, :]
+                    obs_f[:, :, ch:ch+1] = torch.clamp(
+                        c_j * obs_f[:, :, ch:ch+1] + b_j, 0.0, 1.0)
+                    obs_cf[:, :, ch:ch+1] = torch.clamp(
+                        c_j * obs_cf[:, :, ch:ch+1] + b_j, 0.0, 1.0)
+                else:
+                    b_j = brightness[:, j:j+1, :, :]
+                    c_j = contrast[:, j:j+1, :, :]
+                    obs_f[:, ch:ch+1] = torch.clamp(
+                        c_j * obs_f[:, ch:ch+1] + b_j, 0.0, 1.0)
+                    obs_cf[:, ch:ch+1] = torch.clamp(
+                        c_j * obs_cf[:, ch:ch+1] + b_j, 0.0, 1.0)
         else:
-            n_channels = obs_f.shape[1]
-            shape = (obs_f.shape[0], n_channels, 1, 1)
+            # ── Jitter ALL channels (legacy behaviour) ──
+            if is_5d:
+                n_channels = obs_f.shape[2]
+                shape = (obs_f.shape[0], 1, n_channels, 1, 1)
+            else:
+                n_channels = obs_f.shape[1]
+                shape = (obs_f.shape[0], n_channels, 1, 1)
 
-        # Sample per-channel brightness and contrast (same for f and cf)
-        brightness = (
-            torch.rand(shape, device=obs_f.device, dtype=obs_f.dtype)
-            * 2 * self.brightness_range
-            - self.brightness_range
-        )
-        contrast = (
-            1.0
-            + (torch.rand(shape, device=obs_f.device, dtype=obs_f.dtype)
-               * 2 * self.contrast_range
-               - self.contrast_range)
-        )
+            brightness = (
+                torch.rand(shape, device=obs_f.device, dtype=obs_f.dtype)
+                * 2 * self.brightness_range - self.brightness_range
+            )
+            contrast = (
+                1.0 + (torch.rand(shape, device=obs_f.device, dtype=obs_f.dtype)
+                       * 2 * self.contrast_range - self.contrast_range)
+            )
+            obs_f = torch.clamp(contrast * obs_f + brightness, 0.0, 1.0)
+            obs_cf = torch.clamp(contrast * obs_cf + brightness, 0.0, 1.0)
 
-        obs_f = torch.clamp(contrast * obs_f + brightness, 0.0, 1.0)
-        obs_cf = torch.clamp(contrast * obs_cf + brightness, 0.0, 1.0)
         return obs_f, obs_cf
+
+
+class ModelEMA:
+    """Exponential Moving Average of model weights for better generalisation.
+
+    Maintains a shadow copy of model parameters updated as:
+        ema_θ ← decay · ema_θ + (1 − decay) · model_θ
+
+    Produces smoother, better-generalising weights than raw checkpoint
+    selection.  Standard in ConvNeXt-V2, BEiT, MAE, and most modern
+    vision training pipelines.
+
+    Reference:
+        Izmailov et al. (2018) "Averaging Weights Leads to Wider Optima
+        and Better Generalization" (SWA).
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.9999) -> None:
+        self.ema = copy.deepcopy(model)
+        self.ema.eval()
+        self.decay = decay
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        """Update EMA weights from the current model parameters."""
+        for ema_p, model_p in zip(self.ema.parameters(), model.parameters()):
+            ema_p.data.mul_(self.decay).add_(model_p.data, alpha=1.0 - self.decay)
+
+    def state_dict(self) -> dict:
+        """Return the EMA model's state dict for checkpointing."""
+        return self.ema.state_dict()
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -313,7 +394,7 @@ class WarmupCosineScheduler:
         epoch = max(1, epoch)  # Guard: clamp 0-indexed calls to 1
 
         if epoch <= self.warmup_epochs:
-            # Linear warmup: scale from min_lr → base_lr
+            # Linear warmup: scale from ~0 → base_lr (Goyal et al., 2017)
             scale = epoch / max(self.warmup_epochs, 1)
         else:
             # Cosine annealing from base_lr → min_lr
@@ -463,6 +544,136 @@ def lr_range_test(
     return suggested_lr
 
 
+def _build_optimizer_groups(
+    model: nn.Module, base_lr: float, weight_decay: float = 0.01,
+) -> list[dict]:
+    """Build optimizer param groups with layer-wise LR decay (LLRD).
+
+    Early encoder stages receive a lower learning rate to preserve
+    pretrained ConvNeXt-V2 ImageNet-22k features.  Decoder and temporal
+    modules receive the full learning rate.
+
+    This is standard practice for fine-tuning pretrained vision models
+    (BEiT, MAE, ConvNeXt-V2 papers).
+    """
+    lr_scales = {
+        'encoder.stem': 0.1,
+        'encoder.stages.0': 0.1,
+        'encoder.stages.1': 0.25,
+        'encoder.stages.2': 0.5,
+        'encoder.stages.3': 0.75,
+        'encoder.norm': 0.75,
+    }
+    no_decay_keywords = ('bias', 'norm', 'gamma', 'beta')
+
+    groups: dict[tuple[float, float], list] = {}
+    for pname, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        # Strip "module." prefix from DP/DDP
+        clean = pname.replace('module.', '')
+        # Find LR multiplier
+        lr_mult = 1.0
+        for prefix, scale in lr_scales.items():
+            if clean.startswith(prefix):
+                lr_mult = scale
+                break
+        # Weight decay: 0 for bias/norm/GRN, reduced for early encoder
+        is_no_decay = any(k in pname for k in no_decay_keywords)
+        wd = 0.0 if is_no_decay else weight_decay
+        key = (lr_mult, wd)
+        if key not in groups:
+            groups[key] = []
+        groups[key].append(param)
+
+    param_groups = []
+    for (lr_mult, wd), params in sorted(groups.items()):
+        param_groups.append({
+            'params': params,
+            'lr': base_lr * lr_mult,
+            'weight_decay': wd,
+        })
+    return param_groups
+
+
+def _tta_predict(
+    base_model: nn.Module,
+    obs_f: torch.Tensor,
+    obs_cf: torch.Tensor,
+    aspect_channel_idx: int | None = None,
+) -> torch.Tensor:
+    """Test-time augmentation: average predictions over 8 geometric transforms.
+
+    For models with aspect channels (hydro), applies the same directional
+    corrections as RandomFlipRotate to keep inputs physically consistent.
+
+    Parameters
+    ----------
+    base_model : nn.Module
+        Unwrapped model (not DP/DDP wrapped).
+    obs_f, obs_cf : Tensor
+        Factual and counterfactual observations.
+    aspect_channel_idx : int | None
+        Channel index of aspect for directional correction.
+
+    Returns
+    -------
+    Tensor : averaged prediction over all 8 augmentations.
+    """
+    preds = []
+    for k in range(4):  # 0°, 90°, 180°, 270° CCW rotations
+        for do_hflip in (False, True):
+            f = obs_f.clone()
+            cf = obs_cf.clone()
+
+            # Apply horizontal flip
+            if do_hflip:
+                f = torch.flip(f, [-1])
+                cf = torch.flip(cf, [-1])
+                if aspect_channel_idx is not None:
+                    if f.ndim == 5:
+                        f[:, :, aspect_channel_idx] = (
+                            1.0 - f[:, :, aspect_channel_idx]) % 1.0
+                        cf[:, :, aspect_channel_idx] = (
+                            1.0 - cf[:, :, aspect_channel_idx]) % 1.0
+                    else:
+                        f[:, aspect_channel_idx] = (
+                            1.0 - f[:, aspect_channel_idx]) % 1.0
+                        cf[:, aspect_channel_idx] = (
+                            1.0 - cf[:, aspect_channel_idx]) % 1.0
+
+            # Apply rotation
+            if k > 0:
+                f = torch.rot90(f, k, [-2, -1])
+                cf = torch.rot90(cf, k, [-2, -1])
+                if aspect_channel_idx is not None:
+                    shift = k * 0.25
+                    if f.ndim == 5:
+                        f[:, :, aspect_channel_idx] = (
+                            f[:, :, aspect_channel_idx] + shift) % 1.0
+                        cf[:, :, aspect_channel_idx] = (
+                            cf[:, :, aspect_channel_idx] + shift) % 1.0
+                    else:
+                        f[:, aspect_channel_idx] = (
+                            f[:, aspect_channel_idx] + shift) % 1.0
+                        cf[:, aspect_channel_idx] = (
+                            cf[:, aspect_channel_idx] + shift) % 1.0
+
+            # Forward (no deep supervision needed for inference)
+            p = base_model.forward_paired(f, cf)
+
+            # Undo rotation on output
+            if k > 0:
+                p = torch.rot90(p, -k, [-2, -1])
+            # Undo horizontal flip on output
+            if do_hflip:
+                p = torch.flip(p, [-1])
+
+            preds.append(p)
+
+    return torch.stack(preds).mean(0)
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Training — Counterfactual Impact Models
 # ═══════════════════════════════════════════════════════════════════
@@ -471,38 +682,63 @@ MODEL_CONFIGS = {
     "fire": {
         "model_cls": FireRiskNet,
         "dataset_cls": RealFireDataset,
+        # Fire: sharp discontinuous boundaries → aggressive edge focus + SSIM
         "loss_factory": lambda: CounterfactualDeltaLoss(
-            base_loss=EdgeWeightedMSELoss(edge_weight=3.0),
+            base_loss=EdgeWeightedMSELoss(edge_weight=5.0, ssim_weight=0.15),
         ),
         "temporal": True,
         "lr": 3e-4,
         "aspect_channel_idx": None,  # no directional channels
+        # Channel 0 = treecover (real satellite measurement, jitterable).
+        # Channels 2-5 vary between VIIRS sensor data and deterministic
+        # proxies, so we conservatively only jitter forest cover.
+        "jitter_channels": [0],
     },
     "forest": {
         "model_cls": ForestLossNet,
         "dataset_cls": RealHansenDataset,
+        # Forest: spatially diffusive cascade → balanced edge + gradient matching
         "loss_factory": lambda: CounterfactualDeltaLoss(
-            base_loss=EdgeWeightedMSELoss(edge_weight=3.0),
+            base_loss=EdgeWeightedMSELoss(edge_weight=3.0, ssim_weight=0.1),
         ),
         "temporal": True,
         "lr": 3e-4,
         "aspect_channel_idx": None,
+        # Channel 0 = treecover (real Landsat measurement, jitterable).
+        # Channels 1-4 are derived from lossyear (binary/proxy), not raw
+        # sensor data.
+        "jitter_channels": [0],
     },
     "hydro": {
         "model_cls": HydroRiskNet,
         "dataset_cls": RealHydroDataset,
-        "loss_factory": lambda: CounterfactualDeltaLoss(),
+        # Hydro: drainage-network impact → moderate settings
+        "loss_factory": lambda: CounterfactualDeltaLoss(
+            base_loss=EdgeWeightedMSELoss(edge_weight=3.0, ssim_weight=0.1),
+        ),
         "temporal": False,
-        "lr": 3e-4,
+        # Smaller model (no temporal modules) → lower LR avoids overshoot
+        "lr": 2e-4,
         "aspect_channel_idx": 2,  # channel 2 = SRTM aspect (terrain orientation)
+        # Channel 4 (forest) and 5 (ndssi_baseline) are real satellite
+        # measurements amenable to jitter.  Channels 0-3 are static SRTM
+        # terrain products — jittering them is physically wrong.
+        "jitter_channels": [4, 5],
     },
     "soil": {
         "model_cls": SoilRiskNet,
         "dataset_cls": RealSoilDataset,
-        "loss_factory": lambda: CounterfactualDeltaLoss(),
+        # Soil: smoothest degradation process → gentler edge weight
+        "loss_factory": lambda: CounterfactualDeltaLoss(
+            base_loss=EdgeWeightedMSELoss(edge_weight=2.0, ssim_weight=0.1),
+        ),
         "temporal": True,
-        "lr": 3e-4,
-        "aspect_channel_idx": None,
+        # SMAP input provides real grounding → slightly higher LR can work
+        "lr": 2.5e-4,
+        "aspect_channel_idx": 4,  # channel 4 = SRTM aspect (terrain orientation)
+        # Channel 0 (forest) and 1 (smap) are real satellite measurements.
+        # Channels 2-5 are static SRTM terrain — no jitter.
+        "jitter_channels": [0, 1],
     },
 }
 
@@ -529,7 +765,7 @@ def train_single_model(
         Enable automatic mixed precision (requires CUDA/MPS).
     patience : int
         Early stopping patience — stop training if test loss hasn't
-        improved for this many consecutive epochs (default 10).
+        improved for this many consecutive epochs (default 15).
     lr_find : bool
         If True, run a LR range test before training and print the
         suggested learning rate. Does not override the config LR.
@@ -584,11 +820,22 @@ def train_single_model(
 
     dl_kwargs = _get_dataloader_kwargs(device)
 
-    # Imbalanced Data Sampler for extremely sparse targets (fire, forest)
-    # + Data purity sampler for hydro (excludes chips without real MSI data)
+    # ── Data Sampler ──────────────────────────────────────────────────
+    # DDP: DistributedSampler ensures each GPU rank sees different data.
+    # Single-GPU: WeightedRandomSampler for oversampling sparse targets.
+    is_distributed = torch.distributed.is_initialized()
     train_sampler = None
     shuffle = True
-    if name in ["fire", "forest"] and len(train_ds) > 0:
+
+    if is_distributed:
+        # AW-1 fix: DDP MUST use DistributedSampler so each rank sees
+        # a different data shard.  Without this, every GPU trains on
+        # identical data, making gradient averaging a no-op.
+        from torch.utils.data.distributed import DistributedSampler
+        train_sampler = DistributedSampler(train_ds, shuffle=True)
+        shuffle = False
+        print(f"  Using DistributedSampler for DDP training")
+    elif name in ["fire", "forest"] and len(train_ds) > 0:
         print(f"  Building WeightedRandomSampler for {name} extreme sparsity...")
         # Assign higher sample weight to chips with known fire data or
         # high forest cover (more likely to have deforestation events)
@@ -628,7 +875,10 @@ def train_single_model(
             shuffle = False
             print(f"    {n_valid} chips with real MSI data, {n_excluded} excluded")
         else:
-            print(f"    ⚠ No chips with has_real_msi_smap — falling back to uniform sampling")
+            raise RuntimeError(
+                f"Hydro model requires real MSI/SMAP data but none found. "
+                f"Run: python datasets/download_msi_smap.py --tiles-dir {tiles_dir}"
+            )
 
     train_loader = DataLoader(
         train_ds, batch_size=base_batch_size, shuffle=shuffle, sampler=train_sampler, **dl_kwargs,
@@ -644,7 +894,6 @@ def train_single_model(
 
     # Model definition with Multi-GPU wrapper
     model = config["model_cls"]().to(device)
-    is_distributed = torch.distributed.is_initialized()
     if is_distributed:
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         model = torch.nn.parallel.DistributedDataParallel(
@@ -655,9 +904,10 @@ def train_single_model(
         print(f"  Wrapping model in DataParallel across {num_gpus} GPUs.")
         model = torch.nn.DataParallel(model)
 
-    # Extract the base model for Siamese forward calls
-    # (DataParallel / DistributedDataParallel only parallelise .forward(),
-    # not custom methods like .forward_paired / .forward_paired_deep)
+    # Extract the base model for Siamese forward calls that bypass DP/DDP
+    # (validation, TTA, LR range test).  Training forward now goes through
+    # model() via the overridden forward() that dispatches to
+    # forward_paired_deep(), enabling proper DP batch splitting (AW-3).
     base_model = model.module if hasattr(model, "module") else model
 
     params = sum(p.numel() for p in model.parameters())
@@ -668,18 +918,38 @@ def train_single_model(
     print(f"  Global Batch Size: {global_batch_size}, Effective: {effective_batch}")
 
     # Optimizer + Scheduler
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=lr, weight_decay=0.01
-    )
+    # Layer-wise LR decay (LLRD): early encoder stages get lower LR to
+    # preserve pretrained ConvNeXt-V2 ImageNet-22k features.  Decoder
+    # and temporal modules get the full LR.  Bias/norm/GRN params are
+    # excluded from weight decay (standard best practice).
+    # Reference: BEiT, MAE, ConvNeXt-V2 fine-tuning protocols.
+    param_groups = _build_optimizer_groups(model, base_lr=lr, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(param_groups)
+    n_total_params = sum(len(g['params']) for g in param_groups)
+    n_lr_groups = len(param_groups)
+    print(f"  Optimizer: {n_total_params} params in {n_lr_groups} LLRD groups")
+
     warmup_epochs = max(1, epochs // 10)  # 10% warmup
-    scheduler = WarmupCosineScheduler(optimizer, warmup_epochs, epochs)
-    print(f"  Warmup epochs: {warmup_epochs}")
+    # AW-9 fix: set cosine schedule to complete before early stopping
+    # would typically trigger, so the model experiences the low-LR
+    # fine-tuning tail rather than plateauing at 50% of base LR.
+    cosine_total = warmup_epochs + max(1, int((epochs - warmup_epochs) * 0.75))
+    scheduler = WarmupCosineScheduler(optimizer, warmup_epochs, cosine_total)
+    print(f"  Warmup epochs: {warmup_epochs}, cosine cycle: {cosine_total} epochs")
 
     # Loss + Deep Supervision + Augmentation
     base_criterion = config["loss_factory"]() if "loss_factory" in config else config["loss_cls"]()
     criterion = DeepSupervisionWrapper(base_criterion, aux_weight=0.3)
     augment = RandomFlipRotate(aspect_channel_idx=config.get("aspect_channel_idx"))
-    radiometric = RadiometricJitter()  # mild brightness/contrast jitter for inputs only
+    # AW-2/AW-7 fix: only jitter channels with real radiometric sensor data.
+    # Terrain-derived channels (elevation, slope, aspect, flow_acc) are
+    # static DEM products — jittering them adds physically impossible noise.
+    radiometric = RadiometricJitter(
+        jitter_channels=config.get("jitter_channels"),
+    )
+
+    # AW-4: Exponential Moving Average for better generalisation
+    ema = ModelEMA(base_model, decay=0.9999)
 
     # AMP setup — device-aware autocast type
     # Default to AMP on CUDA (A100 excels with mixed precision)
@@ -713,6 +983,13 @@ def train_single_model(
         # Reproducible per-epoch randomisation
         if hasattr(train_ds, "set_epoch"):
             train_ds.set_epoch(epoch)
+        # AW-1: DDP sampler must know the epoch for proper shuffling
+        if hasattr(train_sampler, "set_epoch"):
+            train_sampler.set_epoch(epoch)
+        # AW-10: propagate epoch to test/val datasets so temporal windows
+        # vary across epochs (test_ds/val_ds are Subsets of full_test_ds)
+        if hasattr(full_test_ds, "set_epoch"):
+            full_test_ds.set_epoch(epoch)
 
         # ── Train (Siamese counterfactual) ──
         model.train()
@@ -736,10 +1013,11 @@ def train_single_model(
 
             # Forward pass with optional AMP
             with torch.amp.autocast(device_type=amp_device_type, enabled=amp_enabled):
-                # Siamese paired forward with deep supervision
-                # Use base_model to bypass DataParallel (which only wraps .forward())
-                # Returns: (delta, deep_deltas, out_factual, out_counterfactual)
-                pred_delta, deep_deltas, out_f, out_cf = base_model.forward_paired_deep(
+                # Siamese paired forward with deep supervision.
+                # AW-3 fix: call through model() (not base_model) so
+                # DP/DDP can scatter the batch across GPUs.  The
+                # overridden forward() dispatches to forward_paired_deep().
+                pred_delta, deep_deltas, out_f, out_cf = model(
                     obs_f, obs_cf
                 )
 
@@ -788,6 +1066,8 @@ def train_single_model(
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
+                # AW-4: update EMA after each optimizer step
+                ema.update(base_model)
 
             epoch_loss += loss.item() * accumulation_steps  # undo scaling for logging
             # Raw MSE (same metric as test) for comparable learning curves
@@ -848,11 +1128,10 @@ def train_single_model(
             best_test_loss = avg_test
             epochs_without_improvement = 0
             weight_path = os.path.join(weights_dir, f"{name}_model.pt")
-            # Save the UNWRAPPED model state dict so checkpoints work
-            # regardless of whether training used DP/DDP or bare model.
-            # evaluate_models.py loads into an unwrapped model, so keys
-            # must not have the "module." prefix.
-            torch.save(base_model.state_dict(), weight_path)
+            # AW-4: save EMA weights (smoother, better-generalising).
+            # Keys have no "module." prefix — compatible with loading
+            # into an unwrapped model in evaluate_models.py.
+            torch.save(ema.state_dict(), weight_path)
         else:
             epochs_without_improvement += 1
 
@@ -872,16 +1151,16 @@ def train_single_model(
                   f"(no improvement for {patience} epochs)")
             break
 
-    # ── Final Validation (held-out spatial test tiles, Siamese) ──
-    print(f"\n  ── Final Validation (held-out tiles, {len(val_ds)} chips) ──")
+    # ── Final Validation (held-out spatial test tiles, Siamese + TTA) ──
+    print(f"\n  ── Final Validation (held-out tiles, {len(val_ds)} chips, 8× TTA) ──")
     best_state = torch.load(
         os.path.join(weights_dir, f"{name}_model.pt"),
         map_location=device, weights_only=True,
     )
-    # Load into the unwrapped base_model (checkpoint was saved from
-    # base_model.state_dict(), so keys have no "module." prefix).
+    # Load EMA checkpoint into the unwrapped base_model.
     base_model.load_state_dict(best_state)
     model.eval()
+    aspect_ch = config.get("aspect_channel_idx")
     total_mse = 0.0
     total_soft_dice = 0.0
     all_val_preds = []
@@ -892,7 +1171,12 @@ def train_single_model(
             obs_f = obs_f.to(device)
             obs_cf = obs_cf.to(device)
             target = target.to(device)
-            pred_delta = base_model.forward_paired(obs_f, obs_cf)
+            # AW-5: test-time augmentation — average over 8 geometric
+            # transforms (4 rotations × 2 flips) for 1–5% Dice improvement.
+            pred_delta = _tta_predict(
+                base_model, obs_f, obs_cf,
+                aspect_channel_idx=aspect_ch,
+            )
             if pred_delta.shape[2:] != target.shape[2:]:
                 target = F.interpolate(
                     target, size=pred_delta.shape[2:],

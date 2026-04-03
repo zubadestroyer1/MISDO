@@ -215,6 +215,7 @@ class ConvNeXtV2Backbone(nn.Module):
         dims: Tuple[int, ...] = (96, 192, 384, 768),
         depths: Tuple[int, ...] = (3, 3, 9, 3),
         drop_path_rate: float = 0.1,
+        pretrained: bool = False,
     ) -> None:
         super().__init__()
         self.dims = dims
@@ -253,7 +254,10 @@ class ConvNeXtV2Backbone(nn.Module):
         # Final layer norm on bottleneck
         self.norm = nn.LayerNorm(dims[-1], eps=1e-6)
 
-        self._init_weights()
+        if pretrained:
+            self._load_pretrained(in_channels)
+        else:
+            self._init_weights()
 
     def _init_weights(self) -> None:
         for m in self.modules():
@@ -265,6 +269,64 @@ class ConvNeXtV2Backbone(nn.Module):
                 nn.init.trunc_normal_(m.weight, std=0.02)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+
+    def _load_pretrained(self, in_channels: int) -> None:
+        """Load ImageNet-22k pretrained ConvNeXt-V2 Base weights via timm.
+
+        timm handles in_chans adaptation automatically by repeating
+        the 3-channel stem weights cyclically for in_chans > 3.
+        We match parameters by shape + name suffix to handle the
+        different module nesting between timm and our architecture.
+        """
+        try:
+            import timm
+        except ImportError:
+            print("    \u26a0 timm not installed \u2014 using random initialisation.")
+            print("    Install with: pip install timm")
+            self._init_weights()
+            return
+
+        print(f"    Loading pretrained ConvNeXt-V2 Base weights "
+              f"(in_chans={in_channels})...")
+        ref = timm.create_model(
+            'convnextv2_base.fcmae_ft_in22k_in1k_384',
+            pretrained=True,
+            in_chans=in_channels,
+        )
+
+        # Collect pretrained parameters
+        ref_params = {}
+        for name, param in ref.named_parameters():
+            ref_params[name] = param.data.clone()
+
+        # Match by shape + name suffix to handle module nesting differences
+        own_state = self.state_dict()
+        loaded = 0
+        used_ref_keys: set = set()
+        for own_key in sorted(own_state.keys()):
+            own_val = own_state[own_key]
+            # Try direct key match first
+            if own_key in ref_params and ref_params[own_key].shape == own_val.shape:
+                own_state[own_key] = ref_params[own_key]
+                used_ref_keys.add(own_key)
+                loaded += 1
+                continue
+            # Try suffix match (handles different module nesting)
+            parts = own_key.split('.')
+            suffix_str = '.'.join(parts[-2:]) if len(parts) >= 2 else own_key
+            for ref_key, ref_val in ref_params.items():
+                if ref_key in used_ref_keys:
+                    continue
+                if ref_key.endswith(suffix_str) and ref_val.shape == own_val.shape:
+                    own_state[own_key] = ref_val
+                    used_ref_keys.add(ref_key)
+                    loaded += 1
+                    break
+
+        self.load_state_dict(own_state)
+        total = len(own_state)
+        print(f"    \u2713 Loaded {loaded}/{total} pretrained parameters")
+        del ref  # free memory
 
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
         x = self.stem(x)  # [B, dims[0], H/4, W/4]
@@ -297,7 +359,7 @@ class ConvNeXtV2Backbone(nn.Module):
 # ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    for in_ch, name in [(7, "fire"), (6, "forest"), (6, "hydro"), (5, "soil")]:
+    for in_ch, name in [(7, "fire"), (6, "forest"), (6, "hydro"), (6, "soil")]:
         backbone = ConvNeXtV2Backbone(in_channels=in_ch)
         x = torch.randn(1, in_ch, 256, 256)
         features = backbone(x)

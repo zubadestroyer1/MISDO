@@ -11,4 +11,6 @@ timm
 pystac-client
 planetary-computer
 rasterio
+xarray
+zarr
 Pillow

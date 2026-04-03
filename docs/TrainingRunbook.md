@@ -173,15 +173,17 @@ python test_real_pipeline.py
 
 All models use **Edge-Weighted MSE Loss** which upweights pixels near deforestation edges (3× weight).
 
-### 4.2 Temporal Split Strategy
+### 4.2 Split Strategy
 
 | Split | Deforestation Events | Impact Observed By | Spatial Tiles |
 |---|---|---|---|
-| **Train** | 2001–2016 | ≤ 2018 | 80% "train" tiles |
-| **Test** | 2015–2018 | ≤ 2020 | Same "train" tiles |
-| **Validate** | 2019–2021 | ≤ 2023 | 20% "test" tiles (held-out) |
+| **Train** | Full range (2001–2023) | Full range | 80% "train" tiles |
+| **Test** | Full range (2001–2023) | Full range | First half of 20% "test" tiles |
+| **Validate** | Full range (2001–2023) | Full range | Second half of 20% "test" tiles |
 
-**Sliding temporal windows**: each `__getitem__` randomly samples (T₁, T₂) within the split's valid range, multiplying effective dataset size ~100× compared to fixed windows.
+**Pure Spatial Tile-Level Splitting**: To prevent spatial data leakage, tiles are strictly assigned to train or test. There is NO temporal splitting; models see the full 23-year range of deforestation events across all splits.
+
+**Sliding temporal windows**: each `__getitem__` randomly samples (T₁, T₂) within the available valid range, multiplying effective dataset size ~100× compared to fixed windows.
 
 ### 4.3 Train All 4 Models (Recommended Command)
 

@@ -4,15 +4,17 @@ SoilImpactNet — Soil Degradation Impact Model
 ConvNeXt-V2 + UNet++ for predicting how deforestation increases
 soil degradation in surrounding areas.
 
-Input  : [B, T, 5, 256, 256]  or  [B, 5, 256, 256]
+Input  : [B, T, 7, 256, 256]  or  [B, 7, 256, 256]
 Output : [B, 1, 256, 256]  (soil degradation impact delta, [0, 1])
 
-Channels (5):
-    0: moisture (forest * 0.8 + 0.2, soil moisture proxy)
-    1: veg_water (forest * 0.9, vegetation water content proxy)
-    2: temp (1 - forest * 0.6, soil temperature proxy)
-    3: slope (SRTM, normalised degrees)
-    4: deforestation_mask (binary: 1=cleared between T₁ and T₂)
+Channels (7):
+    0: forest_cover (canopy %, deforestation-aware)
+    1: smap_soil_moisture (baseline moisture, normalised)
+    2: slope (SRTM, normalised degrees)
+    3: elevation (SRTM DEM, normalised)
+    4: aspect (SRTM, sin-encoded, [0, 1))
+    5: flow_accumulation (log-normalised)
+    6: deforestation_mask (binary: 1=cleared between T₁ and T₂)
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ class SoilRiskNet(DomainRiskNet):
     increase, topsoil erosion) occurs in surrounding areas when the
     indicated tiles are cleared.
     """
-    IN_CHANNELS: int = 5
+    IN_CHANNELS: int = 7
 
 
 if __name__ == "__main__":
@@ -36,7 +38,7 @@ if __name__ == "__main__":
     params = sum(p.numel() for p in model.parameters())
     print(f"SoilRiskNet parameters: {params:,}")
 
-    x = torch.randn(1, 5, 256, 256)
+    x = torch.randn(1, 7, 256, 256)
     y = model(x)
     print(f"Single frame: {y.shape}  [{y.min():.3f}, {y.max():.3f}]")
 

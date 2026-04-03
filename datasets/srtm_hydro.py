@@ -4,8 +4,17 @@ SRTM Hydro Dataset — Counterfactual Erosion Impact (Synthetic)
 Generates synthetic terrain data where the target is the INCREASE
 in downstream erosion/pollution caused by upstream deforestation.
 
-Input:  [B, 6, H, W]  — 5 terrain features + deforestation mask
+Input:  [B, 7, H, W]  — 5 terrain features + ndssi_baseline + deforestation mask
 Target: [B, 1, H, W]  — erosion impact delta [0, 1]
+
+Channels (7):
+    0: elevation (DEM, normalised)
+    1: slope (degrees, normalised)
+    2: aspect (sin-encoded, [0, 1))
+    3: flow_accumulation (log-normalised)
+    4: forest_cover (canopy %, deforestation-aware)
+    5: ndssi_baseline (baseline water quality, normalised)
+    6: deforestation_mask (binary: 1=cleared)
 """
 
 from __future__ import annotations
@@ -78,10 +87,17 @@ class SRTMHydroDataset(Dataset):
         cleared_forest = forest.copy()
         cleared_forest[deforestation_mask > 0.5] = 0.0
 
-        # Stack: [6, H, W]
+        # Synthetic NDSSI baseline — mimics pre-clearing water quality.
+        # Higher values = more suspended sediment in baseline conditions.
+        ndssi_baseline = np.clip(
+            gaussian_filter(rng.randn(H, W), sigma=15) * 0.2 + 0.3,
+            0, 1,
+        ).astype(np.float32)
+
+        # Stack: [7, H, W] — matches RealHydroDataset channel layout
         obs = np.stack([
             elev_norm, slope_norm, aspect, flow_acc,
-            cleared_forest, deforestation_mask,
+            cleared_forest, ndssi_baseline, deforestation_mask,
         ], axis=0)
 
         # ── Counterfactual erosion target ──
