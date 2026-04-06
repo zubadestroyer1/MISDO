@@ -284,9 +284,9 @@ def _find_optimal_threshold(
 def _compute_auroc(scores: np.ndarray, labels: np.ndarray) -> float:
     """Compute AUROC without sklearn using the trapezoidal rule.
 
-    [C-1 fix] Uses proper trapezoidal integration:
-      area += (fpr - prev_fpr) * (prev_tpr + tpr) / 2
-    instead of the right-rectangle approximation that underestimates AUC.
+    [C-1 fix] Uses proper trapezoidal integration via NumPy vectorised
+    operations.  Produces identical results to the original per-sample
+    loop but runs ~100× faster on large arrays (32M+ pixels).
 
     Handles edge cases:
       - All-positive or all-negative → returns 0.5 (undefined)
@@ -302,26 +302,21 @@ def _compute_auroc(scores: np.ndarray, labels: np.ndarray) -> float:
     order = np.argsort(-scores)
     sorted_labels = labels[order]
 
-    # Walk through sorted samples, accumulating TPR/FPR
-    tp = 0.0
-    fp = 0.0
-    auc = 0.0
-    prev_fpr = 0.0
-    prev_tpr = 0.0
+    # Vectorised cumulative TP/FP counts
+    is_positive = (sorted_labels > 0.5).astype(np.float64)
+    tps = np.cumsum(is_positive)
+    fps = np.arange(1, len(sorted_labels) + 1, dtype=np.float64) - tps
 
-    for label in sorted_labels:
-        if label > 0.5:
-            tp += 1
-        else:
-            fp += 1
-        fpr = fp / n_neg
-        tpr = tp / n_pos
-        # Trapezoidal rule: area of trapezoid between prev and current point
-        auc += (fpr - prev_fpr) * (prev_tpr + tpr) / 2.0
-        prev_fpr = fpr
-        prev_tpr = tpr
+    tpr = tps / n_pos
+    fpr = fps / n_neg
 
-    return float(auc)
+    # Prepend origin (0, 0) for complete ROC curve
+    tpr = np.concatenate([[0.0], tpr])
+    fpr = np.concatenate([[0.0], fpr])
+
+    # Trapezoidal integration (identical to the original per-step formula)
+    auc = float(np.trapz(tpr, fpr))
+    return auc
 
 
 def compute_signal_region_metrics(

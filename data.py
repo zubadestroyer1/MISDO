@@ -1,7 +1,15 @@
 """
-MISDO Module 1 — Multi-Modal Data Ingestion
-============================================
-Synthetic Earth Observation dataset generator for local development.
+⚠️  DEPRECATED — Early Prototype Module
+========================================
+This module is from the early MISDO prototype and is NOT used in
+production training.  Production training uses:
+  - ``train_real_models.py`` + ``datasets/real_datasets.py``
+
+Kept for backward compatibility with older test scripts only.
+Do NOT add new functionality here.
+
+Original description:
+    Synthetic Earth Observation dataset generator for local development.
 
 Channels (20 total):
     0-9   : Sentinel-2 Optical / NIR / SWIR

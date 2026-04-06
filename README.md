@@ -56,7 +56,7 @@ This is learned from **real before-and-after satellite data** (Hansen GFC defore
 
 ## Models
 
-All models use a **ConvNeXt-V2 Base** encoder + **UNet++ decoder** + **DilatedContextModule** (ASPP) at bottleneck for long-range impact. Output uses ReLU + clamp(0,1) instead of sigmoid.
+All models use a **ConvNeXt-V2 Base** encoder + **UNet++ decoder** + **DilatedContextModule** (ASPP) at bottleneck for long-range impact. Output uses **Sigmoid** activation.
 
 | Model | Params | Input | Target | Data Source |
 |---|---|---|---|---|
@@ -72,7 +72,7 @@ All models use a **ConvNeXt-V2 Base** encoder + **UNet++ decoder** + **DilatedCo
 - **DilatedContextModule** (ASPP-style) at bottleneck — multi-rate dilated convolutions for 1–5 km impact propagation
 - **Multi-head temporal attention** for fusing multi-timestep inputs (Fire, Forest, Soil)
 - **Siamese counterfactual design** — paired forward pass isolates causal deforestation impact
-- **ReLU + clamp output** for sharper gradients on near-zero impact deltas
+- **Sigmoid activation** for smooth gradients everywhere, avoiding dead gradients near zero in Siamese delta computation
 
 ### Key Training Features
 
