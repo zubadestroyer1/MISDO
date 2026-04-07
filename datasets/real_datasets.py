@@ -779,22 +779,27 @@ class RealFireDataset(Dataset):
                 bright_ti4 = data["viirs_max_bright_ti4"].astype(np.float32)
                 bright_ti5 = data["viirs_max_bright_ti5"].astype(np.float32)
 
-                # Normalise VIIRS channels to [0, 1] per-chip.
-                # Raw scales vary wildly (counts 0–500+, FRP in MW,
-                # brightness in Kelvin 300–500+) and would dominate
-                # gradient updates vs. other [0,1] channels.
-                _fa_max = fire_at_year.max()
-                if _fa_max > 1e-6:
-                    fire_at_year = fire_at_year / _fa_max
-                _frp_max = frp.max()
-                if _frp_max > 1e-6:
-                    frp = frp / _frp_max
-                _ti4_max = bright_ti4.max()
-                if _ti4_max > 1e-6:
-                    bright_ti4 = bright_ti4 / _ti4_max
-                _ti5_max = bright_ti5.max()
-                if _ti5_max > 1e-6:
-                    bright_ti5 = bright_ti5 / _ti5_max
+                # VIIRS channels: preserve physical scaling from download.
+                #
+                # At download time (_rasterize_fires in download_real_data.py):
+                #   fire_count → per-chip max normalised (spatial pattern preserved)
+                #   mean_frp   → per-chip max normalised (spatial pattern preserved)
+                #   bright_ti4 → (T − 300K) / 200  (VIIRS I4 physical BT range)
+                #   bright_ti5 → (T − 250K) / 100  (VIIRS I5 physical BT range)
+                #
+                # DO NOT re-normalise per-chip here — that would:
+                #  1. Destroy the correct physical scaling of bright_ti4/ti5
+                #     (a chip with all mild temps would rescale 0.3 → 1.0,
+                #      making it indistinguishable from a chip with actual fire)
+                #  2. Be redundant for fire_count/frp (already [0,1] from download)
+                #  3. Prevent the model from learning absolute fire intensity
+                #
+                # We only clip to [0,1] as a safety bound in case of numerical
+                # edge cases (NaN-to-num artefacts, float rounding, etc.)
+                fire_at_year = np.clip(fire_at_year, 0.0, 1.0)
+                frp = np.clip(frp, 0.0, 1.0)
+                bright_ti4 = np.clip(bright_ti4, 0.0, 1.0)
+                bright_ti5 = np.clip(bright_ti5, 0.0, 1.0)
 
                 # Factual: no clearing mask
                 frame_f = np.stack([

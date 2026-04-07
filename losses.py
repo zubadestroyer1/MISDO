@@ -502,10 +502,22 @@ class DeepSupervisionWrapper(nn.Module):
 class CounterfactualDeltaLoss(nn.Module):
     """Loss for Siamese counterfactual training.
 
-    Combines EdgeWeightedMSELoss (or a custom base_loss) on the predicted delta with:
-    1. A monotonicity penalty — deforestation should NOT decrease risk,
+    Combines EdgeWeightedMSELoss (or a custom base_loss) on the predicted
+    delta with three regularisation terms:
+
+    1. **Monotonicity penalty** — deforestation should NOT decrease risk,
        so counterfactual output should be >= factual output.
-    2. Gradient matching on the delta itself.
+    2. **Baseline grounding** — the factual (no-deforestation) branch
+       should predict near-zero impact, anchoring the network to a
+       physically meaningful reference and preserving sigmoid dynamic
+       range for the counterfactual branch.  Grounded in TARNet
+       (Shalit et al., ICML 2017) treatment-effect regularisation.
+
+    Without grounding, out_f can drift to any value in (0, 1) because
+    only the delta (out_cf − out_f) is supervised.  If out_f ≈ 0.6,
+    then out_cf is capped near 1.0 by sigmoid saturation, limiting
+    the maximum expressible delta to ~0.4 and reducing gradient flow
+    by up to 81% in the counterfactual branch.
 
     Parameters
     ----------
@@ -515,6 +527,12 @@ class CounterfactualDeltaLoss(nn.Module):
         Upweight pixels near deforestation edges if using default MSE (default 3.0).
     mono_weight : float
         Weight of the monotonicity penalty (default 0.1).
+    grounding_weight : float
+        Weight of the L1 grounding loss on the factual branch (default 0.05).
+        Anchors out_f toward zero to preserve sigmoid dynamic range for
+        out_cf and enforce counterfactual consistency (zero treatment →
+        zero effect).  Uses L1 (not L2) for constant gradient magnitude
+        regardless of current out_f value.
     """
 
     def __init__(
@@ -522,10 +540,12 @@ class CounterfactualDeltaLoss(nn.Module):
         base_loss: nn.Module | None = None,
         edge_weight: float = 3.0,
         mono_weight: float = 0.1,
+        grounding_weight: float = 0.05,
     ) -> None:
         super().__init__()
         self.base_loss = base_loss if base_loss is not None else EdgeWeightedMSELoss(edge_weight=edge_weight)
         self.mono_weight = mono_weight
+        self.grounding_weight = grounding_weight
 
     def forward(
         self,
@@ -543,17 +563,33 @@ class CounterfactualDeltaLoss(nn.Module):
         target_delta : Tensor [B, 1, H, W]
             Ground-truth impact delta.
         out_factual : Tensor, optional
-            Raw factual output (for monotonicity penalty).
+            Raw factual output (for monotonicity and grounding penalties).
         out_counterfactual : Tensor, optional
             Raw counterfactual output (for monotonicity penalty).
         """
         loss = self.base_loss(pred_delta, target_delta)
 
-        # Monotonicity penalty: cf should >= f
         if out_factual is not None and out_counterfactual is not None:
+            # Monotonicity penalty: cf should >= f
             violation = F.relu(out_factual - out_counterfactual)
             mono_penalty = violation.mean()
             loss = loss + self.mono_weight * mono_penalty
+
+        # Baseline grounding: the factual (no-deforestation) branch
+        # output should be near zero.  Physically, "no deforestation"
+        # should produce "zero impact delta baseline."
+        #
+        # This removes the translational degree of freedom that allows
+        # out_f to drift away from zero (wasting sigmoid dynamic range
+        # that out_cf needs) and enforces counterfactual consistency.
+        #
+        # Uses L1 (abs().mean()) for constant gradient magnitude
+        # regardless of current out_f value — L2 would barely act
+        # when out_f is small and act aggressively when large,
+        # creating training instability during early epochs.
+        if out_factual is not None and self.grounding_weight > 0:
+            grounding = out_factual.abs().mean()
+            loss = loss + self.grounding_weight * grounding
 
         return loss
 

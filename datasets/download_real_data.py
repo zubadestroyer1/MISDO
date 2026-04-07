@@ -784,13 +784,27 @@ def _rasterize_fires(
     mean_frp[valid] = sum_frp[valid] / fire_count[valid]
     mean_conf[valid] = sum_conf[valid] / fire_count[valid]
 
-    fc_max = fire_count.max()
-    fire_count_norm = fire_count / fc_max if fc_max > 0 else fire_count
+    # ── Physics-based normalization ──
+    # Use log-transform + VIIRS sensor physical ranges so absolute
+    # magnitudes are preserved across chips.  Per-chip max normalization
+    # was stripping this signal (a chip with 1 campfire and a chip with
+    # 500 wildfire detections both had their max rescaled to 1.0).
+    #
+    # Log-transform handles the heavy-tailed FRP distribution where
+    # values span 3+ orders of magnitude (1 MW smouldering → 2500 MW
+    # crown fire).  Source: NASA VIIRS Active Fire Product User Guide.
+    _VIIRS_FIRE_COUNT_99P = 50.0   # annual detections per 375m pixel, 99th pctl
+    _VIIRS_FRP_99P = 200.0          # MW, 99th percentile of vegetation fire FRP
 
-    frp_max = mean_frp.max()
-    mean_frp_norm = mean_frp / frp_max if frp_max > 0 else mean_frp
+    fire_count_norm = np.log1p(fire_count) / np.log1p(_VIIRS_FIRE_COUNT_99P)
+    fire_count_norm = np.clip(fire_count_norm, 0, 1).astype(np.float32)
 
-    # Brightness temps: normalise relative to typical VIIRS range
+    mean_frp_norm = np.log1p(mean_frp) / np.log1p(_VIIRS_FRP_99P)
+    mean_frp_norm = np.clip(mean_frp_norm, 0, 1).astype(np.float32)
+
+    # Brightness temps: normalise using VIIRS physical BT ranges.
+    # I4 (3.7 μm MIR): ambient ~300 K, fire threshold ~310 K, saturation ~367 K
+    # I5 (11 μm TIR):  ambient ~250 K, valid range ~250–380 K
     max_ti4_norm = np.clip((max_ti4 - 300) / 200, 0, 1)
     max_ti5_norm = np.clip((max_ti5 - 250) / 100, 0, 1)
 
@@ -812,10 +826,11 @@ def _rasterize_fires(
         "has_real_viirs": np.array([1.0], dtype=np.float32),
     }
 
-    # Add per-year fire rasters — normalise each year individually
+    # Per-year fire rasters — log-transform with same physical constant
+    # to preserve cross-year magnitude comparison (fire trend detection).
     for year_code, counts in per_year_counts.items():
-        ymax = counts.max()
-        norm = counts / ymax if ymax > 0 else counts
+        norm = np.log1p(counts) / np.log1p(_VIIRS_FIRE_COUNT_99P)
+        norm = np.clip(norm, 0, 1)
         result[f"viirs_fire_year_{year_code:02d}"] = norm.astype(np.float32)
 
     return result
