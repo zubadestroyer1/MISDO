@@ -394,23 +394,46 @@ def augment_dataset(tiles_dir: str) -> None:
           f"Augmenting with Sentinel-2 & TerraClimate...")
 
     import concurrent.futures
+    import threading
     success_count = 0
 
-    # Use 8 workers (not 32) to avoid triggering Planetary Computer
+    # Use 4 workers (reduced from 8) to avoid triggering Planetary Computer
     # rate limits (HTTP 429). Each worker creates its own STAC client
     # for thread safety — pystac_client.Client is NOT thread-safe.
-    n_workers = 8
+    n_workers = 4
+
+    # Thread-local storage: one STAC client per thread (not per chip)
+    _thread_local = threading.local()
+
+    def _get_thread_client():
+        """Get or create a thread-local STAC client with retry."""
+        if not hasattr(_thread_local, "client"):
+            for attempt in range(5):
+                try:
+                    _thread_local.client = setup_pc_client()
+                    return _thread_local.client
+                except Exception as e:
+                    wait = 2 ** attempt
+                    print(f"  STAC client init failed (attempt {attempt+1}/5): {e}")
+                    print(f"  Retrying in {wait}s...")
+                    time.sleep(wait)
+            # Final attempt — let it raise
+            _thread_local.client = setup_pc_client()
+        return _thread_local.client
 
     def process_wrapper(args):
         idx, entry = args
-        # Thread-local STAC client (avoids shared-session race conditions)
-        thread_client = setup_pc_client()
         chip_path = os.path.join(tiles_dir, entry["file"])
         print(f"[{idx + 1}/{len(all_entries)}] Processing {entry['file']}...")
         try:
+            thread_client = _get_thread_client()
             return process_chip(thread_client, chip_path)
         except Exception as e:
             print(f"  Error processing {entry['file']}: {e}")
+            # Reset the client so the next chip gets a fresh one
+            _thread_local.client = None
+            if hasattr(_thread_local, "client"):
+                delattr(_thread_local, "client")
             return False
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:

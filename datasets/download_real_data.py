@@ -1048,7 +1048,8 @@ def download_tile(
     print(f"\n  [{tile_name}] {tile_info['region']} — {tile_info['description']}")
     print(f"    Tile: {tile_code}  |  Target: {chips_per_tile} chips  |  Split: {split}")
     srtm_status = "✓ Real SRTM" if srtm_cache_dir else "Proxy"
-    viirs_status = "✓ Real VIIRS" if firms_key else "No VIIRS"
+    viirs_status = ("✓ Real VIIRS (bulk archive)" if viirs_archive is not None
+                     else ("✓ Real VIIRS (API)" if firms_key else "No VIIRS"))
     print(f"    Data: {srtm_status} | {viirs_status}")
 
     # Generate candidate positions
