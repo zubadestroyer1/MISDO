@@ -188,8 +188,9 @@ class DomainRiskNet(nn.Module):
         out_f = self.decode(b_f, s_f)
         out_cf = self.decode(b_cf, s_cf)
 
-        # Delta = counterfactual - factual (deforestation increases risk)
-        delta = torch.clamp(out_cf - out_f, 0.0, 1.0)
+        # Delta = counterfactual - factual. 
+        # We do not clamp here to ensure gradients flow freely if cf < f.
+        delta = out_cf - out_f
         return delta
 
     def forward_paired_deep(
@@ -240,7 +241,7 @@ class DomainRiskNet(nn.Module):
             out_cf, deep_cf = result_cf, []
 
         # Main delta = cf - f in output space
-        delta = torch.clamp(out_cf - out_f, 0.0, 1.0)
+        delta = out_cf - out_f
 
         # Deep supervision deltas: matched intermediate outputs.
         # aux_cf[i] and aux_f[i] come from the same decoder node
@@ -248,7 +249,7 @@ class DomainRiskNet(nn.Module):
         # level of abstraction — gradient signal is clean.
         deep_deltas = []
         for aux_cf, aux_f in zip(deep_cf, deep_f):
-            deep_deltas.append(torch.clamp(aux_cf - aux_f, 0.0, 1.0))
+            deep_deltas.append(aux_cf - aux_f)
 
         return delta, deep_deltas, out_f, out_cf
 
