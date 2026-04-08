@@ -315,7 +315,8 @@ def _compute_auroc(scores: np.ndarray, labels: np.ndarray) -> float:
     fpr = np.concatenate([[0.0], fpr])
 
     # Trapezoidal integration (identical to the original per-step formula)
-    auc = float(np.trapz(tpr, fpr))
+    # Numpy 2.0+ compatibility: trapz was renamed to trapezoid
+    auc = float(np.trapezoid(tpr, fpr))
     return auc
 
 
