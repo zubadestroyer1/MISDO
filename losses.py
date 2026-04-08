@@ -268,9 +268,9 @@ class SSIMLoss(nn.Module):
         C = pred.shape[1]  # number of channels (typically 1)
 
         # Expand kernel to match input channels (groups=C for depthwise conv)
-        # Cast to input dtype for AMP float16 compatibility — the registered
-        # buffer is float32 but inputs may arrive as float16 under autocast.
-        kernel = self._kernel.to(dtype=pred.dtype).expand(C, 1, -1, -1)
+        # Cast to input dtype and device for AMP float16/CUDA compatibility — the registered
+        # buffer is float32 on CPU by default.
+        kernel = self._kernel.to(device=pred.device, dtype=pred.dtype).expand(C, 1, -1, -1)
 
         # Local means via Gaussian-weighted convolution
         mu_p = F.conv2d(pred, kernel, padding=pad, groups=C)
