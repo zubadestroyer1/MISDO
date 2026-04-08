@@ -11,7 +11,7 @@ Loss Functions:
     GradientMSELoss         — MSE + gradient-matching regulariser for smooth risk surfaces
     SmoothMSELoss           — MSE + gradient-matching + Pearson correlation reward
     SSIMLoss                — Differentiable Structural Similarity Index loss
-    EdgeWeightedMSELoss     — Charbonnier + SSIM + edge upweighting + gradient matching
+    EdgeWeightedMSELoss     — Huber + SSIM + edge upweighting + gradient matching
     CounterfactualDeltaLoss — Main training loss: EdgeWeightedMSE on delta + monotonicity penalty
     DeepSupervisionWrapper  — Wraps any loss to add auxiliary losses from UNet++ nodes
 
@@ -33,11 +33,12 @@ from torch import Tensor
 # Numerical safety constant — prevents log(0) in BCE
 _EPS: float = 1e-7
 
-# Charbonnier epsilon — controls the L1/L2 transition point.
-# At ε = 1e-3, errors > ~0.001 get near-L1 gradient (outlier-robust),
-# while errors < ~0.001 get smooth L2 gradient (stable near zero).
-# This is standard in image super-resolution (EDSR, SRResNet).
-_CHARB_EPS: float = 1e-3
+# Huber (smooth L1) beta — controls the L1/L2 transition point.
+# At β = 0.01, errors > 0.01 get L1 gradient (outlier-robust),
+# while errors < 0.01 get L2 gradient (stable near zero).
+# Unlike Charbonnier (sqrt), gradient is always error/β near zero,
+# never vanishing — critical for float16 AMP stability.
+_HUBER_BETA: float = 0.01
 
 
 class FocalBCELoss(nn.Module):
@@ -303,13 +304,14 @@ class SSIMLoss(nn.Module):
 
 
 class EdgeWeightedMSELoss(nn.Module):
-    """Charbonnier + SSIM + gradient-matching with edge upweighting.
+    """Huber + SSIM + gradient-matching with edge upweighting.
 
     The primary loss for counterfactual impact prediction.  Combines:
 
-    1. **Charbonnier pixel-wise loss** (√(error² + ε²)) — more robust
-       to outliers than MSE, produces sharper edges on sparse targets.
-       Standard in image super-resolution (EDSR, SRResNet, SwinIR).
+    1. **Huber (smooth L1) pixel-wise loss** — L2 for small errors
+       (stable gradient near zero) and L1 for large errors (robust
+       to outliers).  Uses ``F.smooth_l1_loss`` for native float16
+       stability under AMP.
     2. **SSIM structural similarity** — captures local luminance,
        contrast, and structure correlation in sliding windows.
     3. **Edge upweighting** — 3–5× weight on pixels near deforestation
@@ -328,15 +330,11 @@ class EdgeWeightedMSELoss(nn.Module):
     grad_weight : float
         Weight of the gradient-matching term (default 0.2).
     ssim_weight : float
-        Weight of the SSIM structural similarity term (default 0.1).
+        Weight of the SSIM structural similarity term (default 0.01).
     base_weight : float
         Weight for non-edge pixels (default 1.0).
-    charb_eps : float
-        Charbonnier epsilon controlling L1/L2 transition (default 1e-3).
-    focal_gamma : float
-        Focal exponent for down-weighting easy background pixels.
-        Higher values push more gradient budget toward hard impact-zone
-        pixels where the model most needs to learn (default 2.0).
+    huber_beta : float
+        Huber loss beta controlling L1/L2 transition (default 0.01).
     """
 
     def __init__(
@@ -344,10 +342,9 @@ class EdgeWeightedMSELoss(nn.Module):
         edge_weight: float = 3.0,
         edge_radius: int = 5,
         grad_weight: float = 0.2,
-        ssim_weight: float = 0.1,
+        ssim_weight: float = 0.01,
         base_weight: float = 1.0,
-        charb_eps: float = _CHARB_EPS,
-        focal_gamma: float = 2.0,
+        huber_beta: float = _HUBER_BETA,
     ) -> None:
         super().__init__()
         self.edge_weight = edge_weight
@@ -355,8 +352,7 @@ class EdgeWeightedMSELoss(nn.Module):
         self.grad_weight = grad_weight
         self.ssim_weight = ssim_weight
         self.base_weight = base_weight
-        self.charb_eps = charb_eps
-        self.focal_gamma = focal_gamma
+        self.huber_beta = huber_beta
 
         # Dilation kernel for edge detection (max pool approximates dilation)
         self._kernel_size = 2 * edge_radius + 1
@@ -398,32 +394,13 @@ class EdgeWeightedMSELoss(nn.Module):
         return weight_map
 
     def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        # ── Weighted Charbonnier loss ──
-        # Charbonnier: sqrt((pred - target)² + ε²)
-        # Behaves like L2 for small errors (smooth gradient at zero),
-        # and like L1 for large errors (robust to outliers, sharper edges).
+        # ── Weighted Huber (smooth L1) loss ──
+        # Huber: L2 for |error| < beta, L1 for |error| >= beta.
+        # Unlike Charbonnier (sqrt), gradient is always error/β near zero,
+        # never vanishing — critical for float16 AMP stability on sparse targets.
         weight_map = self._compute_edge_mask(target)
-        error_sq = (pred - target) ** 2
-        charbonnier = torch.sqrt(error_sq + self.charb_eps ** 2)
-
-        # Focal modulation: down-weight easy background pixels.
-        # For target≈0, pred≈0 pixels: focal_mod → 1^γ → 1 (no change)
-        # would naively be strongest. Instead, we use target magnitude
-        # as the "easy" indicator: pixels with higher target signal
-        # get full weight, while background pixels (target≈0) that the
-        # model already predicts correctly get reduced weight.
-        # focal_mod = (target + ε)^γ ensures impact-zone pixels get
-        # full gradient while zero-background pixels get scaled down.
-        if self.focal_gamma > 0:
-            # Scale between [ε^γ, 1.0] — impact pixels get ~1.0
-            focal_mod = (target.clamp(0, 1) + 1e-6) ** self.focal_gamma
-            # Normalise so the max modulator is 1.0
-            focal_mod = focal_mod / (focal_mod.max() + 1e-8)
-            # Ensure minimum weight so background still contributes
-            focal_mod = focal_mod.clamp(min=0.05)
-            pixel_loss = (weight_map * focal_mod * charbonnier).mean()
-        else:
-            pixel_loss = (weight_map * charbonnier).mean()
+        huber = F.smooth_l1_loss(pred, target, beta=self.huber_beta, reduction='none')
+        pixel_loss = (weight_map * huber).mean()
 
         # ── SSIM structural similarity ──
         if self.ssim_loss is not None:
@@ -503,21 +480,10 @@ class CounterfactualDeltaLoss(nn.Module):
     """Loss for Siamese counterfactual training.
 
     Combines EdgeWeightedMSELoss (or a custom base_loss) on the predicted
-    delta with three regularisation terms:
+    delta with a monotonicity regularisation term:
 
     1. **Monotonicity penalty** — deforestation should NOT decrease risk,
        so counterfactual output should be >= factual output.
-    2. **Baseline grounding** — the factual (no-deforestation) branch
-       should predict near-zero impact, anchoring the network to a
-       physically meaningful reference and preserving sigmoid dynamic
-       range for the counterfactual branch.  Grounded in TARNet
-       (Shalit et al., ICML 2017) treatment-effect regularisation.
-
-    Without grounding, out_f can drift to any value in (0, 1) because
-    only the delta (out_cf − out_f) is supervised.  If out_f ≈ 0.6,
-    then out_cf is capped near 1.0 by sigmoid saturation, limiting
-    the maximum expressible delta to ~0.4 and reducing gradient flow
-    by up to 81% in the counterfactual branch.
 
     Parameters
     ----------
@@ -527,12 +493,6 @@ class CounterfactualDeltaLoss(nn.Module):
         Upweight pixels near deforestation edges if using default MSE (default 3.0).
     mono_weight : float
         Weight of the monotonicity penalty (default 0.1).
-    grounding_weight : float
-        Weight of the L1 grounding loss on the factual branch (default 0.05).
-        Anchors out_f toward zero to preserve sigmoid dynamic range for
-        out_cf and enforce counterfactual consistency (zero treatment →
-        zero effect).  Uses L1 (not L2) for constant gradient magnitude
-        regardless of current out_f value.
     """
 
     def __init__(
@@ -540,12 +500,10 @@ class CounterfactualDeltaLoss(nn.Module):
         base_loss: nn.Module | None = None,
         edge_weight: float = 3.0,
         mono_weight: float = 0.1,
-        grounding_weight: float = 0.05,
     ) -> None:
         super().__init__()
         self.base_loss = base_loss if base_loss is not None else EdgeWeightedMSELoss(edge_weight=edge_weight)
         self.mono_weight = mono_weight
-        self.grounding_weight = grounding_weight
 
     def forward(
         self,
@@ -563,7 +521,7 @@ class CounterfactualDeltaLoss(nn.Module):
         target_delta : Tensor [B, 1, H, W]
             Ground-truth impact delta.
         out_factual : Tensor, optional
-            Raw factual output (for monotonicity and grounding penalties).
+            Raw factual output (for monotonicity penalty).
         out_counterfactual : Tensor, optional
             Raw counterfactual output (for monotonicity penalty).
         """
@@ -574,22 +532,6 @@ class CounterfactualDeltaLoss(nn.Module):
             violation = F.relu(out_factual - out_counterfactual)
             mono_penalty = violation.mean()
             loss = loss + self.mono_weight * mono_penalty
-
-        # Baseline grounding: the factual (no-deforestation) branch
-        # output should be near zero.  Physically, "no deforestation"
-        # should produce "zero impact delta baseline."
-        #
-        # This removes the translational degree of freedom that allows
-        # out_f to drift away from zero (wasting sigmoid dynamic range
-        # that out_cf needs) and enforces counterfactual consistency.
-        #
-        # Uses L1 (abs().mean()) for constant gradient magnitude
-        # regardless of current out_f value — L2 would barely act
-        # when out_f is small and act aggressively when large,
-        # creating training instability during early epochs.
-        if out_factual is not None and self.grounding_weight > 0:
-            grounding = out_factual.abs().mean()
-            loss = loss + self.grounding_weight * grounding
 
         return loss
 
@@ -665,18 +607,18 @@ if __name__ == "__main__":
     assert not torch.isnan(ssim_zero), "SSIM NaN on zero inputs!"
     print(f"  SSIM(zero, zero):   {ssim_zero.item():.6f}  (expected ~0.0)")
 
-    # ── Charbonnier vs MSE comparison ──
-    print("\n── Charbonnier behaviour test ──")
-    ew = EdgeWeightedMSELoss(ssim_weight=0.0)  # Charbonnier only, no SSIM
-    loss_charb = ew(pred, target)
-    assert not torch.isnan(loss_charb), "NaN in Charbonnier!"
-    print(f"  EdgeWeightedMSE (Charbonnier, no SSIM): {loss_charb.item():.6f}")
+    # ── Huber vs Huber+SSIM comparison ──
+    print("\n── Huber behaviour test ──")
+    ew = EdgeWeightedMSELoss(ssim_weight=0.0)  # Huber only, no SSIM
+    loss_huber = ew(pred, target)
+    assert not torch.isnan(loss_huber), "NaN in Huber!"
+    print(f"  EdgeWeightedMSE (Huber, no SSIM): {loss_huber.item():.6f}")
     ew_ssim = EdgeWeightedMSELoss(ssim_weight=0.1)
-    loss_charb_ssim = ew_ssim(pred, target)
-    assert not torch.isnan(loss_charb_ssim), "NaN in Charbonnier+SSIM!"
-    print(f"  EdgeWeightedMSE (Charbonnier + SSIM):   {loss_charb_ssim.item():.6f}")
+    loss_huber_ssim = ew_ssim(pred, target)
+    assert not torch.isnan(loss_huber_ssim), "NaN in Huber+SSIM!"
+    print(f"  EdgeWeightedMSE (Huber + SSIM):   {loss_huber_ssim.item():.6f}")
     # SSIM component should add to the loss
-    assert loss_charb_ssim > loss_charb, (
+    assert loss_huber_ssim > loss_huber, (
         "Adding SSIM should increase loss (structural imperfection adds penalty)"
     )
 
@@ -707,7 +649,7 @@ if __name__ == "__main__":
     # ── Production combination: DS + CounterfactualDelta + EdgeWeightedMSE ──
     print("\nProduction loss combination test (DS + CounterfactualDelta):")
     cf_base = CounterfactualDeltaLoss(
-        base_loss=EdgeWeightedMSELoss(edge_weight=5.0, ssim_weight=0.15),
+        base_loss=EdgeWeightedMSELoss(edge_weight=5.0, ssim_weight=0.01),
     )
     ds_cf = DeepSupervisionWrapper(cf_base, aux_weight=0.3)
     deep_deltas = [torch.sigmoid(torch.randn(2, 1, 32, 32)) for _ in range(3)]

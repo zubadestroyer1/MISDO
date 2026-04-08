@@ -334,7 +334,7 @@ def test_loss_decreases():
         target = F.interpolate(target, size=delta1.shape[2:], mode="bilinear", align_corners=False)
 
     criterion = DeepSupervisionWrapper(
-        CounterfactualDeltaLoss(base_loss=EdgeWeightedMSELoss(edge_weight=3.0, ssim_weight=0.1)),
+        CounterfactualDeltaLoss(base_loss=EdgeWeightedMSELoss(edge_weight=3.0, ssim_weight=0.01)),
         aux_weight=0.3,
     )
     loss1 = criterion(delta1, target, deep1, out_factual=outf1, out_counterfactual=outcf1)
@@ -615,7 +615,7 @@ def test_deep_supervision_resolution():
 @_test("CounterfactualDeltaLoss penalises monotonicity violations")
 def test_monotonicity():
     loss_fn = CounterfactualDeltaLoss(
-        base_loss=EdgeWeightedMSELoss(edge_weight=3.0, ssim_weight=0.1),
+        base_loss=EdgeWeightedMSELoss(edge_weight=3.0, ssim_weight=0.01),
         mono_weight=0.5,
     )
     pred = torch.rand(2, 1, 64, 64)
@@ -698,7 +698,7 @@ def test_amp_stability():
                                    mode="bilinear", align_corners=False)
 
     criterion = DeepSupervisionWrapper(
-        CounterfactualDeltaLoss(base_loss=EdgeWeightedMSELoss(edge_weight=3.0, ssim_weight=0.1)),
+        CounterfactualDeltaLoss(base_loss=EdgeWeightedMSELoss(edge_weight=3.0, ssim_weight=0.01)),
         aux_weight=0.3,
     )
     # Need grad for backward

@@ -684,7 +684,7 @@ MODEL_CONFIGS = {
         "dataset_cls": RealFireDataset,
         # Fire: sharp discontinuous boundaries → aggressive edge focus + SSIM
         "loss_factory": lambda: CounterfactualDeltaLoss(
-            base_loss=EdgeWeightedMSELoss(edge_weight=5.0, ssim_weight=0.15),
+            base_loss=EdgeWeightedMSELoss(edge_weight=5.0, ssim_weight=0.01),
         ),
         "temporal": True,
         "lr": 3e-4,
@@ -699,7 +699,7 @@ MODEL_CONFIGS = {
         "dataset_cls": RealHansenDataset,
         # Forest: spatially diffusive cascade → balanced edge + gradient matching
         "loss_factory": lambda: CounterfactualDeltaLoss(
-            base_loss=EdgeWeightedMSELoss(edge_weight=3.0, ssim_weight=0.1),
+            base_loss=EdgeWeightedMSELoss(edge_weight=3.0, ssim_weight=0.01),
         ),
         "temporal": True,
         "lr": 3e-4,
@@ -714,7 +714,7 @@ MODEL_CONFIGS = {
         "dataset_cls": RealHydroDataset,
         # Hydro: drainage-network impact → moderate settings
         "loss_factory": lambda: CounterfactualDeltaLoss(
-            base_loss=EdgeWeightedMSELoss(edge_weight=3.0, ssim_weight=0.1),
+            base_loss=EdgeWeightedMSELoss(edge_weight=3.0, ssim_weight=0.01),
         ),
         "temporal": False,
         # Smaller model (no temporal modules) → lower LR avoids overshoot
@@ -730,7 +730,7 @@ MODEL_CONFIGS = {
         "dataset_cls": RealSoilDataset,
         # Soil: smoothest degradation process → gentler edge weight
         "loss_factory": lambda: CounterfactualDeltaLoss(
-            base_loss=EdgeWeightedMSELoss(edge_weight=2.0, ssim_weight=0.1),
+            base_loss=EdgeWeightedMSELoss(edge_weight=2.0, ssim_weight=0.01),
         ),
         "temporal": True,
         # SMAP input provides real grounding → slightly higher LR can work
@@ -949,7 +949,7 @@ def train_single_model(
     )
 
     # AW-4: Exponential Moving Average for better generalisation
-    ema = ModelEMA(base_model, decay=0.9999)
+    ema = ModelEMA(base_model, decay=0.999)
 
     # AMP setup — device-aware autocast type
     # Default to AMP on CUDA (A100 excels with mixed precision)
