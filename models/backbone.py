@@ -271,12 +271,25 @@ class ConvNeXtV2Backbone(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def _load_pretrained(self, in_channels: int) -> None:
-        """Load ImageNet-22k pretrained ConvNeXt-V2 Base weights via timm.
+        """Load ImageNet-22k pretrained ConvNeXt-V2 Tiny weights via timm.
+
+        Our backbone uses dims=(96, 192, 384, 768) which matches
+        ConvNeXt-V2 Tiny, NOT Base (128, 256, 512, 1024).
 
         timm handles in_chans adaptation automatically by repeating
         the 3-channel stem weights cyclically for in_chans > 3.
-        We match parameters by shape + name suffix to handle the
-        different module nesting between timm and our architecture.
+
+        Name translation rules (our name → timm name):
+            dwconv      → conv_dw       (depthwise conv)
+            pwconv1     → mlp.fc1       (first pointwise / linear)
+            pwconv2     → mlp.fc2       (second pointwise / linear)
+            grn.gamma   → mlp.grn.weight (GRN scale)
+            grn.beta    → mlp.grn.bias   (GRN shift)
+            norm        → norm           (LayerNorm — same name)
+
+        Downsample layers in stages 1-3:
+            Our:  stages.X.blocks.0.{1,3}  (inside nn.Sequential blocks[0])
+            Timm: stages.X.downsample.{0,1}
         """
         try:
             import timm
@@ -286,46 +299,123 @@ class ConvNeXtV2Backbone(nn.Module):
             self._init_weights()
             return
 
-        print(f"    Loading pretrained ConvNeXt-V2 Base weights "
+        print(f"    Loading pretrained ConvNeXt-V2 Tiny weights "
               f"(in_chans={in_channels})...")
         ref = timm.create_model(
-            'convnextv2_base.fcmae_ft_in22k_in1k_384',
+            'convnextv2_tiny.fcmae_ft_in22k_in1k_384',
             pretrained=True,
             in_chans=in_channels,
         )
 
-        # Collect pretrained parameters
-        ref_params = {}
-        for name, param in ref.named_parameters():
-            ref_params[name] = param.data.clone()
+        # Collect ALL pretrained state (parameters + buffers like LN stats)
+        ref_state = {}
+        for name, param in ref.state_dict().items():
+            # Skip classification head FC layer — we don't have one
+            # But keep head.norm — it maps to our final LayerNorm
+            if name.startswith('head.fc.'):
+                continue
+            ref_state[name] = param.clone()
 
-        # Match by shape + name suffix to handle module nesting differences
+        def _translate_key(own_key: str) -> str | None:
+            """Translate our parameter name to the corresponding timm name."""
+
+            # ── Stem ──
+            # Our stem: [Conv2d(0), _CFtoLast(1), LayerNorm(2), _CLtoFirst(3)]
+            # Timm stem: [Conv2d(0), LayerNorm(1)]
+            if own_key.startswith('stem.'):
+                if own_key.startswith('stem.0.'):
+                    return own_key  # Conv2d — same index
+                if own_key.startswith('stem.2.'):
+                    # Our LayerNorm is at index 2 (after permute module),
+                    # timm's is at index 1
+                    return own_key.replace('stem.2.', 'stem.1.')
+                return None
+
+            # ── Final norm ──
+            if own_key in ('norm.weight', 'norm.bias'):
+                return own_key.replace('norm.', 'head.norm.')
+
+            # ── Downsample layers (stages 1-3) ──
+            # Our downsample is blocks[0] which is an nn.Sequential:
+            #   blocks.0 = Sequential(_CFtoLast(0), LayerNorm(1), _CLtoFirst(2), Conv2d(3))
+            # Timm has a separate downsample:
+            #   downsample = Sequential(LayerNorm(0), Conv2d(1))
+            for stage_idx in range(1, 4):
+                ds_prefix = f'stages.{stage_idx}.blocks.0.'
+                if own_key.startswith(ds_prefix):
+                    suffix = own_key[len(ds_prefix):]
+                    # Our LayerNorm at index 1 → timm's downsample index 0
+                    if suffix.startswith('1.'):
+                        return f'stages.{stage_idx}.downsample.0.{suffix[2:]}'
+                    # Our Conv2d at index 3 → timm's downsample index 1
+                    if suffix.startswith('3.'):
+                        return f'stages.{stage_idx}.downsample.1.{suffix[2:]}'
+                    return None  # permute modules (0, 2) have no params
+
+            # ── ConvNeXt V2 blocks ──
+            # Need to adjust block index for stages 1-3 because our blocks[0]
+            # is the downsample Sequential, so our block N is timm's block N-1
+            import re
+            m = re.match(r'stages\.(\d+)\.blocks\.(\d+)\.(.*)', own_key)
+            if m:
+                stage_idx = int(m.group(1))
+                block_idx = int(m.group(2))
+                remainder = m.group(3)
+
+                # Adjust block index: stages 1-3 have downsample at blocks[0]
+                if stage_idx > 0:
+                    block_idx -= 1
+                    if block_idx < 0:
+                        return None  # downsample layer, handled above
+
+                # Translate parameter names within a block
+                # dwconv → conv_dw
+                remainder = re.sub(r'^dwconv\.', 'conv_dw.', remainder)
+                # pwconv1 → mlp.fc1
+                remainder = re.sub(r'^pwconv1\.', 'mlp.fc1.', remainder)
+                # pwconv2 → mlp.fc2
+                remainder = re.sub(r'^pwconv2\.', 'mlp.fc2.', remainder)
+                # grn.gamma → mlp.grn.weight, grn.beta → mlp.grn.bias
+                remainder = re.sub(r'^grn\.gamma$', 'mlp.grn.weight', remainder)
+                remainder = re.sub(r'^grn\.beta$', 'mlp.grn.bias', remainder)
+                # norm stays as norm
+
+                return f'stages.{stage_idx}.blocks.{block_idx}.{remainder}'
+
+            return None
+
+        # ── Apply translations ──
         own_state = self.state_dict()
         loaded = 0
-        used_ref_keys: set = set()
+        mismatched = []
         for own_key in sorted(own_state.keys()):
-            own_val = own_state[own_key]
-            # Try direct key match first
-            if own_key in ref_params and ref_params[own_key].shape == own_val.shape:
-                own_state[own_key] = ref_params[own_key]
-                used_ref_keys.add(own_key)
-                loaded += 1
+            ref_key = _translate_key(own_key)
+            if ref_key is None:
                 continue
-            # Try suffix match (handles different module nesting)
-            parts = own_key.split('.')
-            suffix_str = '.'.join(parts[-2:]) if len(parts) >= 2 else own_key
-            for ref_key, ref_val in ref_params.items():
-                if ref_key in used_ref_keys:
-                    continue
-                if ref_key.endswith(suffix_str) and ref_val.shape == own_val.shape:
-                    own_state[own_key] = ref_val
-                    used_ref_keys.add(ref_key)
-                    loaded += 1
-                    break
+            if ref_key not in ref_state:
+                mismatched.append((own_key, ref_key, 'missing'))
+                continue
+            ref_val = ref_state[ref_key]
+            # Handle GRN shape difference: timm uses [C] but our GRN
+            # uses [1, C, 1, 1].  Reshape if dimensions match.
+            if ref_val.shape != own_state[own_key].shape:
+                if (ref_val.dim() == 1 and own_state[own_key].dim() == 4
+                        and ref_val.shape[0] == own_state[own_key].shape[1]):
+                    ref_val = ref_val.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+            if ref_val.shape != own_state[own_key].shape:
+                mismatched.append((own_key, ref_key,
+                    f'shape {ref_val.shape} vs {own_state[own_key].shape}'))
+                continue
+            own_state[own_key] = ref_val
+            loaded += 1
 
         self.load_state_dict(own_state)
         total = len(own_state)
         print(f"    \u2713 Loaded {loaded}/{total} pretrained parameters")
+        if mismatched:
+            print(f"    \u26a0 {len(mismatched)} keys could not be matched:")
+            for own_k, ref_k, reason in mismatched[:5]:
+                print(f"      {own_k} → {ref_k}: {reason}")
         del ref  # free memory
 
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
