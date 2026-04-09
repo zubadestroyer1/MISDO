@@ -58,7 +58,12 @@ class DomainRiskNet(nn.Module):
             in_channels=ch,
             dims=_DIMS,
             depths=_DEPTHS,
-            drop_path_rate=0.1,
+            # CRITICAL: In a Siamese counterfactual setup, we compute delta = cf - f.
+            # If drop_path rate > 0, timm applies different random dropout masks to
+            # the factual and counterfactual branches. The resulting 'delta' is dominated
+            # by dropout noise. Because targets are 99.9% zeros, the network learns to
+            # squash all outputs to zero to silence this noise, freezing the model.
+            drop_path_rate=0.0,
             pretrained=True,
         )
 
