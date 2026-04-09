@@ -253,6 +253,17 @@ class UNetPPDecoder(nn.Module):
         # ── Output heads ──
         self.head = nn.Conv2d(d // 4, 1, kernel_size=1)
 
+        # Initialise output head bias so sigmoid(bias) ≈ 0.007 at init.
+        # With default init (bias≈0), sigmoid(0)=0.5 → both Siamese branches
+        # predict ~0.5, yielding delta≈0 which is already near-optimal for
+        # sparse targets (99%+ zeros).  This traps the model in a local
+        # minimum where gradient from the <1% signal pixels is too weak
+        # to escape.  Setting bias=-5 puts both branches near zero, so the
+        # model only needs to learn to INCREASE cf for impacted regions.
+        # Standard for sparse detection (RetinaNet, Lin et al. ICCV 2017 §4.1).
+        _PRIOR_BIAS = -5.0
+        nn.init.constant_(self.head.bias, _PRIOR_BIAS)
+
         # Deep supervision heads (predict at X_{0,1}, X_{0,2}, X_{1,2})
         #
         # Resolution-aware upsampling:
@@ -294,6 +305,12 @@ class UNetPPDecoder(nn.Module):
                 _ds_head_row0b,
                 _ds_head_row1,
             ])
+            # Apply same prior bias to all deep supervision output heads
+            for ds_head in self.ds_heads:
+                # Last module in each Sequential is the 1×1 Conv2d output
+                final_conv = ds_head[-1]
+                if hasattr(final_conv, 'bias') and final_conv.bias is not None:
+                    nn.init.constant_(final_conv.bias, _PRIOR_BIAS)
 
     def forward(
         self,
